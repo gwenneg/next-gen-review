@@ -38,3 +38,57 @@ header {
 .dot.bad {
   background: #cf222e;
 }
+
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.meta {
+  color: GrayText;
+  font-size: 0.875rem;
+}
+
+.prs,
+.repos {
+  list-style: none;
+  padding: 0;
+}
+
+.pr {
+  padding: 0.6rem 0;
+  border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+}
+
+.tag {
+  display: inline-block;
+  margin: 0.25rem 0.4rem 0 0;
+  padding: 0 0.45rem;
+  border-radius: 0.6rem;
+  font-size: 0.75rem;
+  background: color-mix(in srgb, currentColor 10%, transparent);
+}
+
+.reason-requested {
+  background: color-mix(in srgb, #0969da 25%, transparent);
+}
+
+.reason-new_commits {
+  background: color-mix(in srgb, #9a6700 25%, transparent);
+}
+
+.add,
+.ci-success {
+  color: #1a7f37;
+}
+
+.del,
+.ci-failure,
+.ci-error {
+  color: #cf222e;
+}
+
+.error {
+  color: #cf222e;
+}

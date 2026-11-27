@@ -1,10 +1,12 @@
-import { useEffect, useState } from 'react'
-
-type State = 'connecting' | 'ok' | 'bad'
+import { useCallback, useEffect, useState } from 'react'
+import { getQueue, refreshQueue, type QueueResponse } from './api'
+import { useLiveUpdates, type LiveState } from './live'
+import { Queue } from './Queue'
+import { WatchedRepos } from './WatchedRepos'
 
 // Polls the API health endpoint, which also reports whether the database is reachable.
-function useHealth(): State {
-  const [state, setState] = useState<State>('connecting')
+function useHealth(): LiveState {
+  const [state, setState] = useState<LiveState>('connecting')
   useEffect(() => {
     const check = () =>
       fetch('/api/health')
@@ -17,33 +19,7 @@ function useHealth(): State {
   return state
 }
 
-// Keeps a WebSocket open for live updates, and reconnects after a drop.
-function useLiveUpdates(): State {
-  const [state, setState] = useState<State>('connecting')
-  useEffect(() => {
-    let ws: WebSocket
-    let retry: ReturnType<typeof setTimeout>
-    let stopped = false
-    const connect = () => {
-      const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
-      ws = new WebSocket(`${scheme}://${location.host}/api/ws`)
-      ws.onopen = () => setState('ok')
-      ws.onclose = () => {
-        setState('bad')
-        if (!stopped) retry = setTimeout(connect, 2_000)
-      }
-    }
-    connect()
-    return () => {
-      stopped = true
-      clearTimeout(retry)
-      ws.close()
-    }
-  }, [])
-  return state
-}
-
-function Status({ label, state }: { label: string; state: State }) {
+function Status({ label, state }: { label: string; state: LiveState }) {
   return (
     <span title={state}>
       <span className={`dot ${state === 'connecting' ? '' : state}`} />
@@ -53,8 +29,43 @@ function Status({ label, state }: { label: string; state: State }) {
 }
 
 export default function App() {
+  const [queue, setQueue] = useState<QueueResponse>()
+  const [loadError, setLoadError] = useState<string>()
+  const [refreshing, setRefreshing] = useState(false)
+
+  const load = useCallback(() => {
+    getQueue()
+      .then((q) => {
+        setQueue(q)
+        setLoadError(undefined)
+      })
+      .catch((e) => setLoadError(e.message))
+  }, [])
+
+  const refresh = () => {
+    setRefreshing(true)
+    refreshQueue()
+      .then((q) => {
+        setQueue(q)
+        setLoadError(undefined)
+      })
+      .catch((e) => setLoadError(e.message))
+      .finally(() => setRefreshing(false))
+  }
+
+  // Reload every minute too, so "Checked ... ago" and the other times stay current: a poll
+  // that finds no change sends no event.
+  useEffect(() => {
+    const id = setInterval(load, 60_000)
+    return () => clearInterval(id)
+  }, [load])
+
   const health = useHealth()
-  const live = useLiveUpdates()
+  const live = useLiveUpdates((type) => {
+    // resync: the api's database listener reconnected, so events may have been missed.
+    if (type === 'connected' || type === 'queue.changed' || type === 'resync') load()
+  })
+
   return (
     <>
       <header>
@@ -65,8 +76,8 @@ export default function App() {
         </div>
       </header>
       <main>
-        <h2>Review queue</h2>
-        <p>Nothing here yet.</p>
+        <Queue queue={queue} loadError={loadError} refreshing={refreshing} onRefresh={refresh} />
+        <WatchedRepos />
       </main>
     </>
   )

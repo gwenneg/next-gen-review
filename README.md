@@ -20,7 +20,7 @@ Go and Node are not needed to run the stack: the builds happen in containers. Yo
 
 | Tool | Version |
 |---|---|
-| Go | 1.26 or later |
+| Go | 1.26.7 or later (an older Go 1.26 downloads it automatically) |
 | Node.js and npm | 26 (current LTS) |
 
 Ports `8080` and, in dev mode, `5433` must be free on `127.0.0.1`.
@@ -43,7 +43,9 @@ Without it, `docker compose` and `docker buildx` fail with "unknown command". Th
    ```sh
    cp .env.example .env
    ```
-   Set `POSTGRES_PASSWORD` to any value. `CLAUDE_CODE_OAUTH_TOKEN` is only needed for `make check-claude` for now.
+   - `POSTGRES_PASSWORD`: any value.
+   - `GITHUB_TOKEN` (or `GH_TOKEN`, like the `gh` CLI): a fine-grained token with read-only access to public repositories, to list the PRs waiting for you. `.env.example` says how to create it. A `GH_TOKEN` or `GITHUB_TOKEN` exported in your shell wins over `.env`, so check that it's the token you mean: the page shows which variable it came from.
+   - `CLAUDE_CODE_OAUTH_TOKEN`: only needed for `make check-claude` for now.
 2. Start the stack and open http://127.0.0.1:8080:
    ```sh
    make dev   # hot reload, stays in the foreground
@@ -52,6 +54,16 @@ Without it, `docker compose` and `docker buildx` fail with "unknown command". Th
    ```
 
 Both dots at the top of the page turn green when the api, the database and the live updates work.
+
+## The queue
+
+The page lists the open PRs in public repos that are waiting for you:
+
+- **Review requested:** someone asked for your review, directly or through one of your teams, in any repo.
+- **Watched repo:** a PR in a repo you added on the page, not a draft, not yours, and not reviewed by you yet. Watching is meant for repos with fewer than about 50 open PRs: every open PR that fits these rules is listed.
+- **New commits since your review:** a PR you reviewed, where the author pushed commits after your last review.
+
+The api checks GitHub every 2 minutes, and when you click Refresh. The page updates on its own when the list changes. Listing PRs uses no AI tokens.
 
 ## Services
 
