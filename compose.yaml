@@ -28,6 +28,8 @@ services:
       PGDATABASE: review
       PGPASSWORD: ${POSTGRES_PASSWORD}
       PGSSLMODE: disable
+      GH_TOKEN: ${GH_TOKEN:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     depends_on:
       db:
         condition: service_healthy

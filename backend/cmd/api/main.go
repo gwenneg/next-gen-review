@@ -12,11 +12,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cli/go-gh/v2/pkg/auth"
+
 	"github.com/gwenneg/next-gen-review/backend/internal/db"
+	"github.com/gwenneg/next-gen-review/backend/internal/events"
+	"github.com/gwenneg/next-gen-review/backend/internal/github"
+	"github.com/gwenneg/next-gen-review/backend/internal/queue"
 	"github.com/gwenneg/next-gen-review/backend/internal/server"
+	"github.com/gwenneg/next-gen-review/backend/internal/store"
 )
 
-const addr = ":8080"
+const (
+	addr         = ":8080"
+	pollInterval = 2 * time.Minute
+)
 
 func main() {
 	// The runtime image has no curl, so the container health check calls the binary itself.
@@ -42,7 +51,21 @@ func run() error {
 		return err
 	}
 
-	srv := &http.Server{Addr: addr, Handler: server.New(pool), ReadHeaderTimeout: 10 * time.Second}
+	st := store.New(pool)
+	// GH_TOKEN first, then GITHUB_TOKEN, like the gh CLI.
+	token, source := auth.TokenFromEnvOrConfig("github.com")
+	slog.Info("GitHub token", "source", source)
+	gh, err := github.NewClient(token)
+	if err != nil {
+		return err
+	}
+	poller := queue.NewPoller(gh, st, pollInterval)
+	hub := events.NewHub()
+	go hub.Listen(ctx)
+	go poller.Run(ctx)
+
+	handler := server.New(server.Deps{DB: pool, Store: st, Poller: poller, Repos: gh, Events: hub, TokenSource: source})
+	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
 	slog.Info("api listening", "addr", addr)
