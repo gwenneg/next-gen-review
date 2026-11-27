@@ -1,0 +1,52 @@
+# Development overrides: source in the containers, restarted or reloaded on save.
+# Dev images get their own tags, so they never replace the production-like ones.
+# Run with `make dev`, which runs `docker compose -f compose.yaml -f compose.dev.yaml up --watch`.
+services:
+  db:
+    ports:
+      - "127.0.0.1:5433:5432"
+
+  api:
+    image: next-gen-review-api:dev
+    build:
+      target: dev
+    command: ["go", "run", "./cmd/api"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      start_period: 60s
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./backend
+          target: /src
+        - action: rebuild
+          path: ./backend/go.mod
+
+  worker:
+    image: next-gen-review-worker:dev
+    build:
+      target: dev
+    command: ["go", "run", "./cmd/worker"]
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./backend
+          target: /src
+        - action: rebuild
+          path: ./backend/go.mod
+
+  web:
+    image: next-gen-review-web:dev
+    build:
+      target: dev
+    environment:
+      API_URL: http://api:8080
+    develop:
+      watch:
+        - action: sync
+          path: ./frontend
+          target: /app
+          ignore:
+            - node_modules/
+        - action: rebuild
+          path: ./frontend/package-lock.json

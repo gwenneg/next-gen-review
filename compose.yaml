@@ -1,0 +1,59 @@
+# Production-like stack. For development with hot reload, use `make dev` (adds compose.dev.yaml).
+name: next-gen-review
+
+services:
+  db:
+    image: postgres:19-trixie
+    environment:
+      POSTGRES_USER: review
+      POSTGRES_DB: review
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - db-data:/var/lib/postgresql
+    healthcheck:
+      # -h makes it check TCP. Over the Unix socket, the image's temporary first-start server
+      # already answers while port 5432 is still closed.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "review", "-d", "review"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build:
+      context: ./backend
+      target: api
+    environment:
+      PGHOST: db
+      PGUSER: review
+      PGDATABASE: review
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGSSLMODE: disable
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/api", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # Holds the Claude token only. It never gets the GitHub token or the database password.
+  worker:
+    build:
+      context: ./backend
+      target: worker
+    environment:
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+
+  web:
+    build:
+      context: ./frontend
+      target: prod
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  db-data:
