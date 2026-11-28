@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react'
 import Markdown from 'react-markdown'
+import { PostingPanel } from './Posting'
 import {
   cancelReview,
   isActive,
@@ -28,6 +29,7 @@ export function ReviewPanel({ pr, options, latest, workerConnected }: Props) {
   const [open, setOpen] = useState(false)
   const [error, setError] = useState<string>()
   const [busy, setBusy] = useState(false)
+  const [postingOpen, setPostingOpen] = useState(false)
 
   const run = (action: Promise<unknown>, after?: () => void) => {
     setBusy(true)
@@ -69,6 +71,13 @@ export function ReviewPanel({ pr, options, latest, workerConnected }: Props) {
           <div className="markdown">
             <Markdown>{latest.result}</Markdown>
           </div>
+        </details>
+      )}
+      {latest && !active && latest.tokensUsed > 0 && (
+        // The panel loads the comments, so it's only there once the section is opened.
+        <details onToggle={(e) => setPostingOpen(e.currentTarget.open)}>
+          <summary>{latest.postedUrl ? 'Posted to GitHub' : 'Comments for GitHub'}</summary>
+          {postingOpen && <PostingPanel review={latest} headSha={pr.headSha} />}
         </details>
       )}
       {latest && !active && latest.tokensUsed > 0 && <ContinueHint id={latest.id} />}

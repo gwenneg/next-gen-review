@@ -65,7 +65,7 @@ func Main(m *testing.M, pool **pgxpool.Pool) int {
 // Reset empties every table, so each test starts from a clean database.
 func Reset(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	if _, err := pool.Exec(t.Context(), `TRUNCATE events, watched_repos, queue_items, reviews RESTART IDENTITY`); err != nil {
+	if _, err := pool.Exec(t.Context(), `TRUNCATE events, watched_repos, queue_items, reviews, review_comments RESTART IDENTITY`); err != nil {
 		t.Fatal(err)
 	}
 }

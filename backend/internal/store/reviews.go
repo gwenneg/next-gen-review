@@ -20,13 +20,13 @@ var (
 )
 
 const reviewColumns = `id, pr_id, repo, number, head_sha, model, effort, token_cap, context, status,
-	cancel_requested, session_id::text, tokens_used, result, error, created_at, started_at, finished_at`
+	cancel_requested, session_id::text, tokens_used, result, error, created_at, started_at, finished_at, posted_url`
 
 func scanReview(row pgx.CollectableRow) (review.Review, error) {
 	var r review.Review
 	err := row.Scan(&r.ID, &r.PRID, &r.Repo, &r.Number, &r.HeadSHA, &r.Model, &r.Effort, &r.TokenCap, &r.Context,
 		&r.Status, &r.CancelRequested, &r.SessionID, &r.TokensUsed, &r.Result, &r.Error, &r.CreatedAt, &r.StartedAt,
-		&r.FinishedAt)
+		&r.FinishedAt, &r.PostedURL)
 	return r, err
 }
 
@@ -100,11 +100,14 @@ func (s *Store) ClaimReview(ctx context.Context) (review.Review, bool, error) {
 	return r, err == nil, err
 }
 
-// StartReview stores the prompt and moves the review to running. It returns false if the user
-// canceled it while it was being prepared.
-func (s *Store) StartReview(ctx context.Context, id int64, prompt string) (bool, error) {
-	return s.update(ctx, `UPDATE reviews SET status = 'running', prompt = $2
-		WHERE id = $1 AND status = 'preparing' AND NOT cancel_requested`, id, prompt)
+// StartReview stores the prompt and the diff's lines, and moves the review to running. It returns
+// false if the user canceled it while it was being prepared.
+func (s *Store) StartReview(ctx context.Context, id int64, prompt string, lines review.DiffLines) (bool, error) {
+	if lines == nil {
+		lines = review.DiffLines{}
+	}
+	return s.update(ctx, `UPDATE reviews SET status = 'running', prompt = $2, diff_lines = $3
+		WHERE id = $1 AND status = 'preparing' AND NOT cancel_requested`, id, prompt, lines)
 }
 
 // CancelRequested says whether the user asked to cancel the review.
@@ -139,14 +142,31 @@ func (s *Store) CancelReview(ctx context.Context, id int64) (bool, error) {
 		WHERE id = $1 AND status IN ('queued', 'preparing', 'running')`, id)
 }
 
-// FinishReview stores how a review ended. The texts come from claude and from file names in the
-// PR, so NUL bytes and invalid UTF-8, which Postgres refuses in text, are dropped or replaced.
+// FinishReview stores how a review ended, with the comments the AI drafted. The texts come from
+// claude and from file names in the PR, so NUL bytes and invalid UTF-8, which Postgres refuses in
+// text, are dropped or replaced.
 func (s *Store) FinishReview(ctx context.Context, id int64, o review.Outcome) error {
-	changed, err := s.update(ctx, `UPDATE reviews SET status = $2, result = $3, error = $4, tokens_used = $5,
-		finished_at = now() WHERE id = $1 AND status IN ('preparing', 'running')`, id, o.Status, text(o.Result), text(o.Error), o.Tokens)
-	if err == nil && !changed {
-		return fmt.Errorf("review %d: %w", id, review.ErrNotActive)
-	}
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `UPDATE reviews SET status = $2, result = $3, error = $4, tokens_used = $5,
+			finished_at = now() WHERE id = $1 AND status IN ('preparing', 'running')`, id, o.Status, text(o.Result), text(o.Error), o.Tokens)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("review %d: %w", id, review.ErrNotActive)
+		}
+		if o.Drafts != nil {
+			if _, err := tx.Exec(ctx, `UPDATE reviews SET main_comment = $2 WHERE id = $1`, id, text(o.Drafts.Main)); err != nil {
+				return err
+			}
+			for _, c := range o.Drafts.Comments {
+				if err := insertComment(ctx, tx, id, &c); err != nil {
+					return err
+				}
+			}
+		}
+		return addEvent(ctx, tx, review.EventChanged)
+	})
 	return err
 }
 

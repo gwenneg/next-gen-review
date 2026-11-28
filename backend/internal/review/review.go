@@ -32,6 +32,10 @@ var (
 	ErrDownloading = errors.New("the code of this review is already being downloaded: wait for it, then try again")
 	// ErrDownload wraps an error downloading the code from GitHub.
 	ErrDownload = errors.New("download the code again")
+	// ErrPosted means the review's comments were posted to GitHub, so they can't change.
+	ErrPosted = errors.New("this review's comments were already posted to GitHub")
+	// ErrUnknownComment means the review has no comment with this id.
+	ErrUnknownComment = errors.New("the review has no comment with this id")
 )
 
 // Events sent to the page.
@@ -118,6 +122,7 @@ type Review struct {
 	CreatedAt       time.Time  `json:"createdAt"`
 	StartedAt       *time.Time `json:"startedAt"`
 	FinishedAt      *time.Time `json:"finishedAt"`
+	PostedURL       string     `json:"postedUrl"` // the GitHub review its comments were posted as
 }
 
 // Active says whether the review is queued, preparing or running.
@@ -136,21 +141,23 @@ type Resume struct {
 
 // Job is what the worker needs to run a review.
 type Job struct {
-	ID        int64  `json:"id"`
-	Model     string `json:"model"`
-	Effort    string `json:"effort"`
-	TokenCap  int    `json:"tokenCap"`
-	SessionID string `json:"sessionId"`
-	Dir       string `json:"dir"` // the read-only checkout
-	Prompt    string `json:"prompt"`
+	ID        int64     `json:"id"`
+	Model     string    `json:"model"`
+	Effort    string    `json:"effort"`
+	TokenCap  int       `json:"tokenCap"`
+	SessionID string    `json:"sessionId"`
+	Dir       string    `json:"dir"` // the read-only checkout
+	Prompt    string    `json:"prompt"`
+	Lines     DiffLines `json:"-"` // stored when the review starts, for posting its comments
 }
 
 // Outcome is how a run ended.
 type Outcome struct {
-	Status string `json:"status"` // done, failed, canceled or capped
-	Result string `json:"result"`
-	Error  string `json:"error"`
-	Tokens int    `json:"tokens"`
+	Status string  `json:"status"` // done, failed, canceled or capped
+	Result string  `json:"result"`
+	Error  string  `json:"error"`
+	Tokens int     `json:"tokens"`
+	Drafts *Drafts `json:"drafts,omitempty"` // from a review that ended with claude's answer
 }
 
 // PR is what the prompt says about the pull request. Everything but Repo and Number comes from
@@ -163,6 +170,7 @@ type PR struct {
 	Body          string
 	Diff          string
 	DiffTruncated bool
+	Lines         DiffLines // from the whole diff, even when Diff is cut
 }
 
 // untrustedTag matches the start of anything a model could read as an <untrusted> tag, whatever
@@ -187,11 +195,19 @@ func Prompt(pr PR, userContext string) string {
 	if strings.TrimSpace(userContext) != "" {
 		fmt.Fprintf(&b, "Context from the maintainer (trusted):\n%s\n\n", userContext)
 	}
-	b.WriteString("Reply in Markdown, in plain, simple English:\n" +
+	b.WriteString("Answer with the JSON the schema asks for. Write in plain, simple English.\n\n" +
+		"review: Markdown for the maintainer, with these sections:\n" +
 		"1. **What the PR does**, in two or three sentences.\n" +
 		"2. **Findings**, most severe first. For each one: a severity (Critical, High, Medium or Low), the file and line, " +
 		"what is wrong, and how it would fail.\n" +
 		"3. **What you didn't check.**\n" +
-		"If you find nothing wrong, say so in one line under Findings.\n")
+		"If you find nothing wrong, say so in one line under Findings.\n\n" +
+		"summary: a short comment for the PR author, which the maintainer may edit and post on GitHub: in a few sentences, " +
+		"what must change before merging and any questions. No severities, no praise or filler.\n\n" +
+		"comments: inline comments for the PR author, one for each finding about specific lines. path is relative to the " +
+		"repository root. line is the line number in the PR's version of the file, with side RIGHT, or in the old version " +
+		"for a deleted line, with side LEFT. For a range, start_line is its first line, in the same hunk of the diff. Use " +
+		"lines the diff shows when you can. body says what is wrong and what to do, without the severity: that goes in " +
+		"severity. Leave comments empty when there is nothing to say about specific lines.\n")
 	return b.String()
 }

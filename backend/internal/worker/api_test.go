@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -67,7 +68,7 @@ func TestAPI(t *testing.T) {
 	}
 	job := review.Job{ID: 3, Model: "sonnet", Effort: "high", TokenCap: 1000, SessionID: "s", Dir: "/checkouts/3", Prompt: "review"}
 	b.job = &job
-	if got, ok, err := api.Next(ctx); !ok || err != nil || got != job {
+	if got, ok, err := api.Next(ctx); !ok || err != nil || !reflect.DeepEqual(got, job) {
 		t.Errorf("Next() = %+v, %v, %v; want %+v", got, ok, err, job)
 	}
 

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -59,6 +60,12 @@ type Deps struct {
 	Broker  Broker
 	// TokenSource names the variable the GitHub token came from, shown on the page.
 	TokenSource string
+	Drafts      DraftStore
+	// Poster posts reviews to GitHub with GH_REVIEW_TOKEN, as PosterLogin. Nil when posting is off.
+	Poster      Poster
+	PosterLogin string
+
+	postMu *sync.Mutex // one post at a time, so a double click can't post twice
 }
 
 // pingInterval keeps idle WebSockets open: nginx closes a connection after 1h without traffic.
@@ -66,6 +73,7 @@ const pingInterval = 30 * time.Second
 
 // New returns the API handler.
 func New(d Deps) http.Handler {
+	d.postMu = &sync.Mutex{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", d.health)
 	mux.HandleFunc("GET /api/ws", d.events)
@@ -78,6 +86,12 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/reviews", d.reviews)
 	mux.HandleFunc("POST /api/reviews", d.startReview)
 	mux.HandleFunc("POST /api/reviews/{id}/cancel", d.cancelReview)
+	mux.HandleFunc("GET /api/reviews/{id}/posting", d.posting(nil))
+	mux.HandleFunc("PUT /api/reviews/{id}/posting/main", d.posting(d.setMain))
+	mux.HandleFunc("POST /api/reviews/{id}/posting/comments", d.posting(d.addComment))
+	mux.HandleFunc("PUT /api/reviews/{id}/posting/comments/{cid}", d.posting(d.setComment))
+	mux.HandleFunc("DELETE /api/reviews/{id}/posting/comments/{cid}", d.posting(d.deleteComment))
+	mux.HandleFunc("POST /api/reviews/{id}/posting/post", d.posting(d.post))
 	// CrossOriginProtection rejects POST and DELETE requests sent by pages on other sites (CSRF).
 	return localOnly(http.NewCrossOriginProtection().Handler(mux))
 }

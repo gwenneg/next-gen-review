@@ -3,6 +3,7 @@ module github.com/gwenneg/next-gen-review/backend
 go 1.26.7
 
 require (
+	github.com/bluekeyes/go-gitdiff v0.9.0
 	github.com/cli/go-gh/v2 v2.17.0
 	github.com/cli/shurcooL-graphql v0.0.4
 	github.com/coder/websocket v1.8.15

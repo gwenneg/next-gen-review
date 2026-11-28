@@ -82,6 +82,7 @@ export type Review = {
   createdAt: string
   startedAt: string | null
   finishedAt: string | null
+  postedUrl: string // the GitHub review its comments were posted as, or empty
 }
 
 export type ReviewRequest = { prId: string; model: string; effort: string; tokenCap: number; context: string }
@@ -95,3 +96,36 @@ export const getReviews = (activeOnly = false) =>
   call<ReviewsResponse>('GET', activeOnly ? '/api/reviews?active=true' : '/api/reviews')
 export const startReview = (req: ReviewRequest) => call<Review>('POST', '/api/reviews', req)
 export const cancelReview = (id: number) => call<void>('POST', `/api/reviews/${id}/cancel`)
+
+// A review's comments for GitHub. Keep in sync with backend/internal/review/drafts.go.
+
+export type Side = 'RIGHT' | 'LEFT'
+export type ReviewComment = {
+  id: number
+  path: string
+  line: number
+  startLine?: number
+  side: Side
+  body: string
+  inDiff: boolean // GitHub takes it inline; otherwise it's posted in the main comment
+}
+export type Posting = {
+  main: string
+  comments: ReviewComment[]
+  posted: boolean
+  postedUrl: string
+  postedEvent: string
+  postingEnabled: boolean // GH_REVIEW_TOKEN is set
+  postsAs: string // its user
+}
+export type ReviewEvent = 'COMMENT' | 'APPROVE' | 'REQUEST_CHANGES'
+export type NewComment = { path: string; line: number; startLine?: number; side: Side; body: string }
+
+const posting = (id: number, path = '') => `/api/reviews/${id}/posting${path}`
+export const getPosting = (id: number) => call<Posting>('GET', posting(id))
+export const setMainComment = (id: number, body: string) => call<Posting>('PUT', posting(id, '/main'), { body })
+export const addComment = (id: number, c: NewComment) => call<Posting>('POST', posting(id, '/comments'), c)
+export const setComment = (id: number, cid: number, body: string) =>
+  call<Posting>('PUT', posting(id, `/comments/${cid}`), { body })
+export const deleteComment = (id: number, cid: number) => call<Posting>('DELETE', posting(id, `/comments/${cid}`))
+export const postReview = (id: number, event: ReviewEvent) => call<Posting>('POST', posting(id, '/post'), { event })

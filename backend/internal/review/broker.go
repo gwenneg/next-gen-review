@@ -41,7 +41,7 @@ const (
 type Store interface {
 	ClaimReview(ctx context.Context) (Review, bool, error)
 	CancelRequested(ctx context.Context, id int64) (bool, error)
-	StartReview(ctx context.Context, id int64, prompt string) (bool, error)
+	StartReview(ctx context.Context, id int64, prompt string, lines DiffLines) (bool, error)
 	ReviewProgress(ctx context.Context, id int64, tokens int) (stop bool, err error)
 	FinishReview(ctx context.Context, id int64, o Outcome) error
 	RunningReviews(ctx context.Context) ([]int64, error)
@@ -252,7 +252,7 @@ func (b *Broker) prepare(ctx context.Context, r Review) (Job, error) {
 		return Job{}, err
 	}
 	return Job{ID: r.ID, Model: r.Model, Effort: r.Effort, TokenCap: r.TokenCap, SessionID: r.SessionID,
-		Dir: dir, Prompt: Prompt(pr, r.Context)}, nil
+		Dir: dir, Prompt: Prompt(pr, r.Context), Lines: pr.Lines}, nil
 }
 
 // download writes the review's code, at the commit it reviews, into its checkout.
@@ -366,7 +366,7 @@ func (b *Broker) Next(ctx context.Context, wait time.Duration) (Job, bool, error
 		case job = <-b.ready:
 		}
 		// The review is ours now: don't let the worker's request cancel the update.
-		started, err := b.store.StartReview(context.WithoutCancel(ctx), job.ID, job.Prompt)
+		started, err := b.store.StartReview(context.WithoutCancel(ctx), job.ID, job.Prompt, job.Lines)
 		if err != nil || !started {
 			o := Outcome{Status: StatusCanceled}
 			if err != nil {

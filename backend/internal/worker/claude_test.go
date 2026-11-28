@@ -2,8 +2,10 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -40,7 +42,8 @@ const (
 	m1a    = `{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"Looking at the diff."}],"usage":{"input_tokens":100,"cache_creation_input_tokens":50,"cache_read_input_tokens":9000,"output_tokens":10}}}`
 	m1b    = `{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use"}],"usage":{"input_tokens":100,"cache_creation_input_tokens":50,"cache_read_input_tokens":9000,"output_tokens":10}}}`
 	m2     = `{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":10,"output_tokens":5}}}`
-	result = `{"type":"result","subtype":"success","is_error":false,"result":"## Findings\nNone."}`
+	result = `{"type":"result","subtype":"success","is_error":false,"result":"{...}",` +
+		`"structured_output":{"review":"## Findings\nNone.","summary":"","comments":[]}}`
 )
 
 func TestRun(t *testing.T) {
@@ -60,7 +63,7 @@ func TestRun(t *testing.T) {
 		want     review.Outcome
 	}{
 		{"done", fakeClaude(t, false, initOK, m1a, m1b, m2, result), 1000, never, false,
-			review.Outcome{Status: review.StatusDone, Result: "## Findings\nNone.", Tokens: 175}},
+			review.Outcome{Status: review.StatusDone, Result: "## Findings\nNone.", Tokens: 175, Drafts: &review.Drafts{Comments: []review.Comment{}}}},
 		// Events claude already sent before being stopped are still counted.
 		{"API key instead of the subscription", fakeClaude(t, true, initAPIKey, m1a), 1000, never, false,
 			review.Outcome{Status: review.StatusFailed, Result: "Looking at the diff.", Tokens: 160,
@@ -91,7 +94,7 @@ func TestRun(t *testing.T) {
 			}
 			start := time.Now()
 			got := tt.claude.Run(ctx, j, tt.report)
-			if got != tt.want {
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Run() = %+v\nwant %+v", got, tt.want)
 			}
 			// The repo's own settings, hooks and CLAUDE.md must not load: the PR author controls them.
@@ -148,5 +151,40 @@ func TestRunWithoutResult(t *testing.T) {
 	if got.Status != review.StatusFailed || !strings.HasPrefix(got.Error, prefix) || !strings.HasSuffix(got.Error, "x rate limited") ||
 		len(got.Error) > len(prefix)+4096 {
 		t.Errorf("Run() = %s %.80q... (%d bytes), want failed with the end of stderr, at most 4096 bytes of it", got.Status, got.Error, len(got.Error))
+	}
+}
+
+// With the schema, claude's answer is the review text and the drafts for GitHub.
+func TestRunStructured(t *testing.T) {
+	answer := `{"type":"result","subtype":"success","is_error":false,"result":"{...}","structured_output":` +
+		`{"review":"## Findings\nOne.","summary":"Please fix the retry.","comments":[{"path":"a.go","line":3,"side":"RIGHT","severity":"High","body":"Retries forever."}]}}`
+	c := fakeClaude(t, false, initOK, m2, answer)
+	job := review.Job{ID: 1, Model: "sonnet", Effort: "medium", TokenCap: 1000, SessionID: "s", Dir: t.TempDir(), Prompt: "review"}
+	got := c.Run(t.Context(), job, func(context.Context, int) (bool, error) { return false, nil })
+	want := review.Drafts{Main: "Please fix the retry.", Comments: []review.Comment{
+		{Path: "a.go", Line: 3, Side: review.SideRight, Body: "[High] Retries forever."}}}
+	if got.Status != review.StatusDone || got.Result != "## Findings\nOne." || got.Drafts == nil || !reflect.DeepEqual(*got.Drafts, want) {
+		t.Errorf("Run() = %+v, drafts %+v", got, got.Drafts)
+	}
+	args, _ := os.ReadFile(filepath.Join(filepath.Dir(c.Bin), "args"))
+	if !strings.Contains(string(args), "--json-schema "+review.OutputSchema) {
+		t.Errorf("claude args = %s, want the output schema", args)
+	}
+}
+
+// claude may give up on the schema: its last text becomes the review, with a note that nothing
+// was drafted. Without any text, the review failed.
+func TestRunWithoutStructuredOutput(t *testing.T) {
+	job := review.Job{ID: 1, Model: "sonnet", Effort: "medium", TokenCap: 1000, SessionID: "s", Dir: t.TempDir(), Prompt: "review"}
+	never := func(context.Context, int) (bool, error) { return false, nil }
+	for result, want := range map[string]review.Outcome{
+		"## Findings\nNone.": {Status: review.StatusDone, Result: "## Findings\nNone.", Tokens: 15,
+			Error: "claude didn't return its answer in the expected format: no comments were drafted for GitHub"},
+		"": {Status: review.StatusFailed, Error: "claude returned no answer", Tokens: 15},
+	} {
+		line, _ := json.Marshal(map[string]any{"type": "result", "subtype": "success", "is_error": false, "result": result})
+		if got := fakeClaude(t, false, initOK, m2, string(line)).Run(t.Context(), job, never); !reflect.DeepEqual(got, want) {
+			t.Errorf("Run() with result %q = %+v\nwant %+v", result, got, want)
+		}
 	}
 }

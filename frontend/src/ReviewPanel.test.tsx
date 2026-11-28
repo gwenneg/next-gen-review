@@ -90,4 +90,22 @@ describe('ReviewPanel', () => {
     render(<ReviewPanel pr={pr} options={options} latest={review({ status, tokensUsed })} workerConnected />)
     expect(screen.queryByText(/make continue/)).toBeNull()
   })
+
+  it('loads the comments for GitHub only when their section is opened', async () => {
+    const { calls } = fakeFetch({
+      '/api/reviews/12/posting': {
+        body: { main: 'Fix it.', comments: [], posted: false, postedUrl: '', postedEvent: '', postingEnabled: true, postsAs: 'me' },
+      },
+    })
+    render(<ReviewPanel pr={pr} options={options} latest={review({ id: 12, status: 'done' })} workerConnected />)
+    expect(calls).toEqual([])
+    await userEvent.click(screen.getByText('Comments for GitHub'))
+    expect(((await screen.findByLabelText('Main comment')) as HTMLTextAreaElement).value).toBe('Fix it.')
+    expect(calls).toEqual(['GET /api/reviews/12/posting'])
+  })
+
+  it('says when the comments were posted', () => {
+    render(<ReviewPanel pr={pr} options={options} latest={review({ status: 'done', postedUrl: 'https://x' })} workerConnected />)
+    expect(screen.getByText('Posted to GitHub')).toBeTruthy()
+  })
 })

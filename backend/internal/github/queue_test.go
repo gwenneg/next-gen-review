@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gwenneg/next-gen-review/backend/internal/review"
 )
 
 // fakeGitHub answers the viewer and search GraphQL queries, the latter by query string (with an
@@ -28,6 +30,10 @@ type fakeGitHub struct {
 
 // tooLarge in diffs answers like GitHub for a PR past 300 files.
 const tooLarge = "406"
+
+// bigDiff is longer than the prompt takes, with a hunk at the end.
+var bigDiff = "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1,1 +1,1 @@\n-" + strings.Repeat("x", maxDiff) +
+	"\n+y\ndiff --git a/z.go b/z.go\n--- a/z.go\n+++ b/z.go\n@@ -5,1 +5,2 @@\n z\n+w\n"
 
 func (f fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	*f.calls++
@@ -278,14 +284,16 @@ func TestPullRequestDiff(t *testing.T) {
 	}
 	f := fakeGitHub{
 		repos: map[string]map[string]any{
-			"o/r/pulls/7": pull(map[string]any{"full_name": "fork/r"}),
-			"o/r/pulls/8": pull(nil), // the fork was deleted
-			"o/r/pulls/9": pull(map[string]any{"full_name": "fork/r"}),
+			"o/r/pulls/7":  pull(map[string]any{"full_name": "fork/r"}),
+			"o/r/pulls/8":  pull(nil), // the fork was deleted
+			"o/r/pulls/9":  pull(map[string]any{"full_name": "fork/r"}),
+			"o/r/pulls/10": pull(map[string]any{"full_name": "fork/r"}),
 		},
 		diffs: map[string]string{
 			"/repos/o/r/pulls/7":                   "diff at new",
 			"/repos/o/r/compare/main...fork:r:old": "diff at old",
 			"/repos/o/r/pulls/9":                   tooLarge,
+			"/repos/o/r/pulls/10":                  bigDiff,
 			"/repos/o/r/compare/main...fork:r:new": "diff of 400 files",
 		},
 	}
@@ -325,5 +333,36 @@ func TestTarballOutlastsRequestTimeout(t *testing.T) {
 	defer body.Close()
 	if b, err := io.ReadAll(body); err != nil || string(b) != "0123456789" {
 		t.Errorf("read %q, %v; want the whole tarball", b, err)
+	}
+}
+
+// The prompt gets the diff's start, and the lines comments can be on come from all of it.
+func TestPullRequestLines(t *testing.T) {
+	f := fakeGitHub{
+		repos: map[string]map[string]any{"o/r/pulls/10": {"title": "Big", "base": map[string]any{"ref": "main"},
+			"head": map[string]any{"sha": "new", "repo": map[string]any{"full_name": "fork/r"}}}},
+		diffs: map[string]string{"/repos/o/r/pulls/10": bigDiff},
+	}
+	pr, err := newTestClient(t, f).PullRequest(t.Context(), "o/r", 10, "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pr.DiffTruncated || len(pr.Diff) != maxDiff {
+		t.Errorf("diff of %d bytes, truncated %v; want the first %d", len(pr.Diff), pr.DiffTruncated, maxDiff)
+	}
+	want := review.DiffLines{"a.go": {"RIGHT": {{1, 1}}, "LEFT": {{1, 1}}}, "z.go": {"RIGHT": {{5, 6}}, "LEFT": {{5, 5}}}}
+	if !reflect.DeepEqual(pr.Lines, want) {
+		t.Errorf("lines = %v, want %v", pr.Lines, want)
+	}
+
+	// A diff too long to read whole is cut in its last file's hunk: the files before it keep their lines.
+	defer func(n int64) { maxDiffLines = n }(maxDiffLines)
+	maxDiffLines = int64(len(bigDiff) - 3)
+	pr, err = newTestClient(t, f).PullRequest(t.Context(), "o/r", 10, "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (review.DiffLines{"a.go": want["a.go"]}); !reflect.DeepEqual(pr.Lines, want) {
+		t.Errorf("lines of a cut diff = %v, want %v", pr.Lines, want)
 	}
 }
