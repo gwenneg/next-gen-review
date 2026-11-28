@@ -65,17 +65,23 @@ var errTimeout = errors.New("the review took too long")
 // maxLine is the longest line of claude's output the worker reads.
 var maxLine = 64 << 20
 
-// Run runs one review in the PR's checkout, which the PR author controls. Read, Grep and Glob are
-// the only tools. --restricted ignores the settings files, so the repo's .claude/settings.json can't
-// add hooks (which would run commands next to the token) or env, and it keeps the file tools inside
-// the checkout. --safe-mode also ignores the repo's CLAUDE.md, skills, agents and commands.
+// Flags are the claude flags of every run in a PR's checkout, which the PR author controls: the
+// review, and a session continued from it. Read, Grep and Glob are the only tools. --restricted
+// ignores the settings files, so the repo's .claude/settings.json can't add hooks (which would run
+// commands next to the token) or env, and it keeps the file tools inside the checkout. --safe-mode
+// also ignores the repo's CLAUDE.md, skills, agents and commands.
+func Flags(model, effort string) []string {
+	return []string{"--model", model, "--effort", effort, "--tools", "Read,Grep,Glob",
+		"--permission-mode", "dontAsk", "--restricted", "--safe-mode", "--strict-mcp-config"}
+}
+
+// Run runs one review in the PR's checkout, with Flags.
 func (c Claude) Run(ctx context.Context, job review.Job, report Report) review.Outcome {
 	ctx, cancel := context.WithTimeoutCause(ctx, c.Timeout, errTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, c.Bin, "-p", "--model", job.Model, "--effort", job.Effort,
-		"--output-format", "stream-json", "--verbose", "--tools", "Read,Grep,Glob",
-		"--permission-mode", "dontAsk", "--restricted", "--safe-mode", "--strict-mcp-config",
-		"--session-id", job.SessionID)
+	args := append([]string{"-p"}, Flags(job.Model, job.Effort)...)
+	args = append(args, "--output-format", "stream-json", "--verbose", "--session-id", job.SessionID)
+	cmd := exec.CommandContext(ctx, c.Bin, args...)
 	cmd.Dir, cmd.Env, cmd.Stdin = job.Dir, c.Env, strings.NewReader(job.Prompt)
 	stderr := &tail{max: 4096}
 	cmd.Stderr = stderr

@@ -7,7 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -68,6 +71,36 @@ func (f *fakeBroker) Finish(_ context.Context, id int64, o review.Outcome) error
 	return nil
 }
 func (f *fakeBroker) WorkerConnected() bool { return true }
+func (f *fakeBroker) Session(context.Context, int64) (review.Resume, error) {
+	return review.Resume{}, review.ErrUnknownReview
+}
+func (f *fakeBroker) PrepareContinue(context.Context, int64) (review.Resume, error) {
+	return review.Resume{}, review.ErrUnknownReview
+}
+func (f *fakeBroker) RemoveCheckout(context.Context, int64, string) error {
+	return review.ErrUnknownReview
+}
+
+// continueBroker answers `worker continue` about review 7.
+type continueBroker struct {
+	fakeBroker
+	resume    review.Resume
+	err       error
+	removed   []string // the downloads RemoveCheckout was called for
+	downloads int      // PrepareContinue calls
+}
+
+func (c *continueBroker) Session(context.Context, int64) (review.Resume, error) {
+	return review.Resume{SessionID: c.resume.SessionID, Model: c.resume.Model, Effort: c.resume.Effort}, c.err
+}
+func (c *continueBroker) PrepareContinue(context.Context, int64) (review.Resume, error) {
+	c.downloads++
+	return c.resume, c.err
+}
+func (c *continueBroker) RemoveCheckout(_ context.Context, _ int64, download string) error {
+	c.removed = append(c.removed, download)
+	return nil
+}
 
 func TestServe(t *testing.T) {
 	defer func(d time.Duration) { retryDelay = d }(retryDelay)
@@ -170,5 +203,184 @@ func TestFinishGivesUpOnRefusal(t *testing.T) {
 	finish(t.Context(), worker.NewAPI(srv.URL), 7, review.Outcome{Status: review.StatusDone})
 	if n := tries.Load(); n != 1 {
 		t.Errorf("tries = %d, want 1", n)
+	}
+}
+
+// `worker continue` opens the review's session in a new download of its code, with the review's
+// restricting flags, and has the code deleted after.
+func TestContinue(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		token     string
+		session   bool  // claude saved a session for the review
+		apiErr    error // from the broker
+		exit      int   // claude's exit code
+		err       string
+		claudeRun bool
+	}{
+		{"continue", []string{"7"}, "fake-token", true, nil, 0, "", true},
+		{"claude fails", []string{"7"}, "fake-token", true, nil, 1, "claude: exit status 1", true},
+		// It's found before downloading anything.
+		{"no session", []string{"7"}, "fake-token", false, nil, 0, "no claude session in this worker", false},
+		{"review still running", []string{"7"}, "fake-token", true, review.ErrActive, 0, "409 Conflict: the review is still active", false},
+		{"no token", []string{"7"}, "", true, nil, 0, "CLAUDE_CODE_OAUTH_TOKEN is not set", false},
+		{"no id", nil, "fake-token", true, nil, 0, "usage: worker continue <review id>", false},
+		{"bad id", []string{"seven"}, "fake-token", true, nil, 0, `"seven" is not a review id`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp, checkout, config := t.TempDir(), t.TempDir(), t.TempDir()
+			if tt.session {
+				if err := os.MkdirAll(filepath.Join(config, "projects", "-checkouts-7"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(config, "projects", "-checkouts-7", "s7.jsonl"), nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			bin := filepath.Join(tmp, "claude")
+			script := fmt.Sprintf("#!/bin/sh\necho \"$@\" > %s/args\npwd > %s/pwd\nexit %d\n", tmp, tmp, tt.exit)
+			if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", tt.token)
+			b := &continueBroker{resume: review.Resume{SessionID: "s7", Model: "haiku", Effort: "low", Dir: checkout, Download: "d1"}, err: tt.apiErr}
+			srv := httptest.NewServer(server.NewInternal(b))
+			defer srv.Close()
+			var out strings.Builder
+			// A session of the review left running by a closed terminal.
+			proc := t.TempDir()
+			earlier := exec.Command("sleep", "30")
+			if err := earlier.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = earlier.Process.Kill() }()
+			stopped := make(chan struct{})
+			go func() { _ = earlier.Wait(); close(stopped) }()
+			pid := filepath.Join(proc, strconv.Itoa(earlier.Process.Pid))
+			_ = os.MkdirAll(pid, 0o755)
+			_ = os.WriteFile(filepath.Join(pid, "cmdline"), []byte("claude\x00--resume\x00s7\x00"), 0o644)
+			c := session{api: worker.NewAPI(srv.URL), claude: bin, configDir: config, procDir: proc,
+				stdin: strings.NewReader(""), stdout: &out, stderr: &out}
+
+			err := c.continueReview(t.Context(), tt.args)
+			if (tt.err == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tt.err)) {
+				t.Fatalf("continueReview() = %v, want an error saying %q", err, tt.err)
+			}
+			args, runErr := os.ReadFile(filepath.Join(tmp, "args"))
+			if ran := runErr == nil; ran != tt.claudeRun {
+				t.Fatalf("claude ran: %v, want %v", ran, tt.claudeRun)
+			}
+			downloaded := tt.token != "" && len(tt.args) == 1 && tt.args[0] == "7" && tt.apiErr == nil && tt.session
+			if downloaded != (b.downloads == 1) {
+				t.Errorf("downloads = %d, want a download: %v", b.downloads, downloaded)
+			}
+			if downloaded != slices.Equal(b.removed, []string{"d1"}) {
+				t.Errorf("checkout deletes = %v, want the download deleted once after it", b.removed)
+			}
+			select {
+			case <-stopped:
+				if !downloaded {
+					t.Error("an earlier session was stopped though nothing was downloaded")
+				}
+			case <-time.After(100 * time.Millisecond):
+				if downloaded {
+					t.Error("the earlier session of the review is still running")
+				}
+			}
+			if !tt.claudeRun {
+				return
+			}
+			want := "--resume s7 --model haiku --effort low --tools Read,Grep,Glob --permission-mode dontAsk --restricted --safe-mode --strict-mcp-config"
+			if got := strings.TrimSpace(string(args)); got != want {
+				t.Errorf("claude args = %s\nwant %s", got, want)
+			}
+			wd, _ := os.ReadFile(filepath.Join(tmp, "pwd"))
+			if real, _ := filepath.EvalSymlinks(checkout); strings.TrimSpace(string(wd)) != real {
+				t.Errorf("claude ran in %s, want the checkout %s", wd, real)
+			}
+		})
+	}
+}
+
+// A session left running when its terminal went away is stopped before the review is continued
+// again. Other processes, and other reviews' sessions, are left alone.
+func TestStopEarlier(t *testing.T) {
+	proc := t.TempDir()
+	start := func(cmdline ...string) *exec.Cmd {
+		cmd := exec.Command("sleep", "30")
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cmd.Process.Kill() })
+		dir := filepath.Join(proc, strconv.Itoa(cmd.Process.Pid))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "cmdline"), []byte(strings.Join(cmdline, "\x00")+"\x00"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return cmd
+	}
+	// ended is closed when the process exits: a killed child stays a zombie until waited for.
+	ended := func(cmd *exec.Cmd) chan struct{} {
+		c := make(chan struct{})
+		go func() { _ = cmd.Wait(); close(c) }()
+		return c
+	}
+	earlier := ended(start("claude", "--resume", "s7", "--model", "haiku"))
+	others := []chan struct{}{ended(start("claude", "--resume", "s8")), ended(start("worker", "continue", "7"))}
+
+	stopEarlier(proc, "s7", 5*time.Second)
+	select {
+	case <-earlier:
+	case <-time.After(time.Second):
+		t.Fatal("the earlier session is still running")
+	}
+	time.Sleep(100 * time.Millisecond)
+	for i, other := range others {
+		select {
+		case <-other:
+			t.Errorf("process %d was stopped", i)
+		default:
+		}
+	}
+}
+
+// A session that ignores SIGTERM is killed after the wait.
+func TestStopEarlierKills(t *testing.T) {
+	proc := t.TempDir()
+	cmd := exec.Command("sh", "-c", `trap "" TERM; exec sleep 30`)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+	ended := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(ended) }()
+	time.Sleep(100 * time.Millisecond) // the trap is set
+	pid := filepath.Join(proc, strconv.Itoa(cmd.Process.Pid))
+	_ = os.MkdirAll(pid, 0o755)
+	_ = os.WriteFile(filepath.Join(pid, "cmdline"), []byte("claude\x00--resume\x00s7\x00"), 0o644)
+	stopEarlier(proc, "s7", 200*time.Millisecond)
+	select {
+	case <-ended:
+	case <-time.After(time.Second):
+		t.Fatal("a session that ignores SIGTERM still runs")
+	}
+}
+
+// A zombie has exited: its parent just hasn't waited for it yet, and signals still reach it.
+func TestRunning(t *testing.T) {
+	proc := t.TempDir()
+	for pid, stat := range map[string]string{
+		"10": "10 (claude) S 1 10 10 0 -1",     // sleeping
+		"11": "11 (sh -c a) b) Z 1 11 11 0 -1", // exited, with a ")" in its command
+	} {
+		_ = os.MkdirAll(filepath.Join(proc, pid), 0o755)
+		_ = os.WriteFile(filepath.Join(proc, pid, "stat"), []byte(stat), 0o644)
+	}
+	if !running(proc, 10) || running(proc, 11) {
+		t.Errorf("running(10, 11) = %v, %v; want true, false", running(proc, 10), running(proc, 11))
 	}
 }

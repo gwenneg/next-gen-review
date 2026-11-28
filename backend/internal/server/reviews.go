@@ -26,6 +26,9 @@ type Broker interface {
 	Next(ctx context.Context, wait time.Duration) (review.Job, bool, error)
 	Progress(ctx context.Context, id int64, tokens int) (bool, error)
 	Finish(ctx context.Context, id int64, o review.Outcome) error
+	Session(ctx context.Context, id int64) (review.Resume, error)
+	PrepareContinue(ctx context.Context, id int64) (review.Resume, error)
+	RemoveCheckout(ctx context.Context, id int64, download string) error
 	WorkerConnected() bool
 }
 
@@ -149,5 +152,45 @@ func NewInternal(b Broker) http.Handler {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
+	// `worker continue` opens an ended review's claude session again, in a new download of its
+	// code: it checks the session exists, then has the code downloaded, then deleted after.
+	mux.HandleFunc("GET /internal/reviews/{id}/session", continueHandler("find the review", func(r *http.Request, id int64) (any, error) {
+		return b.Session(r.Context(), id)
+	}))
+	mux.HandleFunc("POST /internal/reviews/{id}/continue", continueHandler("prepare the code", func(r *http.Request, id int64) (any, error) {
+		return b.PrepareContinue(r.Context(), id)
+	}))
+	mux.HandleFunc("DELETE /internal/reviews/{id}/checkout", continueHandler("delete the code", func(r *http.Request, id int64) (any, error) {
+		return nil, b.RemoveCheckout(r.Context(), id, r.URL.Query().Get("download"))
+	}))
 	return mux
+}
+
+// continueHandler answers one step of `worker continue` with its result, or 204 when there's
+// none. what names the step in errors that are the api's own.
+func continueHandler(what string, step func(r *http.Request, id int64) (any, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad review id")
+			return
+		}
+		out, err := step(r, id)
+		switch {
+		case errors.Is(err, review.ErrUnknownReview):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, review.ErrActive), errors.Is(err, review.ErrDownloading):
+			writeError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, review.ErrDownload):
+			slog.Warn("continue review", "review", id, "error", err)
+			writeError(w, http.StatusBadGateway, err.Error())
+		case err != nil:
+			slog.Error("continue review: "+what, "review", id, "error", err)
+			writeError(w, http.StatusInternalServerError, what+": "+err.Error())
+		case out == nil:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			writeJSON(w, http.StatusOK, out)
+		}
+	}
 }

@@ -21,8 +21,18 @@ const (
 	StatusCapped    = "capped" // stopped at the token cap
 )
 
-// ErrNotActive means the review already ended, so its outcome can't be stored.
-var ErrNotActive = errors.New("the review is not active")
+var (
+	// ErrNotActive means the review already ended, so its outcome can't be stored.
+	ErrNotActive = errors.New("the review is not active")
+	// ErrActive means the review hasn't ended yet, so it can't be continued.
+	ErrActive = errors.New("the review is still active: continue it once it ended")
+	// ErrUnknownReview means no review has this id.
+	ErrUnknownReview = errors.New("no review has this id")
+	// ErrDownloading means the review's code is already being downloaded for another continue.
+	ErrDownloading = errors.New("the code of this review is already being downloaded: wait for it, then try again")
+	// ErrDownload wraps an error downloading the code from GitHub.
+	ErrDownload = errors.New("download the code again")
+)
 
 // Events sent to the page.
 const (
@@ -108,6 +118,20 @@ type Review struct {
 	CreatedAt       time.Time  `json:"createdAt"`
 	StartedAt       *time.Time `json:"startedAt"`
 	FinishedAt      *time.Time `json:"finishedAt"`
+}
+
+// Active says whether the review is queued, preparing or running.
+func (r Review) Active() bool {
+	return r.Status == StatusQueued || r.Status == StatusPreparing || r.Status == StatusRunning
+}
+
+// Resume is what `worker continue` needs to open a finished review's claude session again.
+type Resume struct {
+	SessionID string `json:"sessionId"`
+	Model     string `json:"model"`
+	Effort    string `json:"effort"`
+	Dir       string `json:"dir"`      // the checkout, downloaded again
+	Download  string `json:"download"` // names this download, for RemoveCheckout
 }
 
 // Job is what the worker needs to run a review.

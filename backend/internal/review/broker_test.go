@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -25,9 +26,14 @@ type fakeStore struct {
 	failures int // FinishReview calls to fail, as when the database is down
 	calls    int // FinishReview calls
 	running  []int64
+	reviews  map[int64]Review // for Review
 }
 
 func (f *fakeStore) RunningReviews(context.Context) ([]int64, error) { return f.running, nil }
+func (f *fakeStore) Review(_ context.Context, id int64) (Review, bool, error) {
+	r, ok := f.reviews[id]
+	return r, ok, nil
+}
 
 func (f *fakeStore) ClaimReview(context.Context) (Review, bool, error) {
 	f.mu.Lock()
@@ -202,14 +208,16 @@ func TestBrokerCancelWhileWaiting(t *testing.T) {
 	time.Sleep(100 * time.Millisecond) // prepared, and no worker asks for it
 	st.cancel()
 	b.Wake() // as the cancel handler does
+	// Finish stores the outcome, then deletes the checkout: wait for both.
+	kept := func() bool { _, err := os.Stat(filepath.Join(b.checkouts, "1")); return err == nil }
 	deadline := time.Now().Add(time.Second)
-	for st.outcome(1).Status == "" && time.Now().Before(deadline) {
+	for (st.outcome(1).Status == "" || kept()) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if o := st.outcome(1); o.Status != StatusCanceled {
 		t.Errorf("outcome = %+v, want canceled", o)
 	}
-	if _, err := os.Stat(filepath.Join(b.checkouts, "1")); err == nil {
+	if kept() {
 		t.Error("the checkout of the canceled review was kept")
 	}
 }
@@ -388,5 +396,147 @@ func TestWorkerConnected(t *testing.T) {
 	_, _ = b.Progress(t.Context(), 1, 0)
 	if !b.WorkerConnected() {
 		t.Error("not connected after a progress report")
+	}
+}
+
+// An ended review's code is downloaded again for `worker continue`, and deleted after. The code of
+// an active one is its run's.
+func TestPrepareContinue(t *testing.T) {
+	ended := Review{ID: 4, Repo: "o/r", HeadSHA: "seen", Model: "haiku", Effort: "low", SessionID: "s4", Status: StatusDone}
+	running := ended
+	running.ID, running.Status = 5, StatusRunning
+	tests := []struct {
+		name string
+		id   int64
+		gh   fakeGitHub
+		err  error // nil for a download
+	}{
+		{"ended", 4, fakeGitHub{}, nil},
+		{"running", 5, fakeGitHub{}, ErrActive},
+		{"unknown", 6, fakeGitHub{}, ErrUnknownReview},
+		{"download cut off", 4, fakeGitHub{cutOff: true}, ErrDownload},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &fakeStore{reviews: map[int64]Review{4: ended, 5: running}}
+			b := NewBroker(st, tt.gh, t.TempDir())
+			// A checkout left by an earlier continue, or the running review's own.
+			if err := os.MkdirAll(filepath.Join(b.checkouts, strconv.FormatInt(tt.id, 10), "old"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			got, err := b.PrepareContinue(t.Context(), tt.id)
+			_, oldErr := os.Stat(filepath.Join(b.checkouts, strconv.FormatInt(tt.id, 10), "old"))
+			switch {
+			case tt.err == nil:
+				want := Resume{SessionID: "s4", Model: "haiku", Effort: "low", Dir: filepath.Join(b.checkouts, "4"), Download: got.Download}
+				if err != nil || got != want || got.Download == "" {
+					t.Fatalf("PrepareContinue() = %+v, %v; want %+v", got, err, want)
+				}
+				if body, err := os.ReadFile(filepath.Join(got.Dir, "main.go")); err != nil || string(body) != "go" || oldErr == nil {
+					t.Errorf("checkout: main.go = %q, %v; old files kept: %v", body, err, oldErr == nil)
+				}
+				// A session continued again replaces the download; the first one's cleanup keeps it.
+				again, err := b.PrepareContinue(t.Context(), 4)
+				if err != nil || again.Download == got.Download {
+					t.Fatalf("PrepareContinue() again = %+v, %v; want a new download", again, err)
+				}
+				if err := b.RemoveCheckout(t.Context(), 4, got.Download); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Stat(got.Dir); err != nil {
+					t.Error("an earlier session's cleanup deleted the newer download")
+				}
+				if err := b.RemoveCheckout(t.Context(), 4, again.Download); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Stat(got.Dir); err == nil {
+					t.Error("RemoveCheckout() kept the checkout")
+				}
+			case tt.err == ErrDownload:
+				if !errors.Is(err, ErrDownload) {
+					t.Fatalf("PrepareContinue() = %v, want a download error", err)
+				}
+				if entries, _ := os.ReadDir(b.checkouts); len(entries) != 0 {
+					t.Errorf("a broken download left %v", entries)
+				}
+			default:
+				if !errors.Is(err, tt.err) {
+					t.Fatalf("PrepareContinue() = %v, want %v", err, tt.err)
+				}
+				if rmErr := b.RemoveCheckout(t.Context(), tt.id, ""); !errors.Is(rmErr, tt.err) || (tt.id == 5 && oldErr != nil) {
+					t.Errorf("RemoveCheckout() = %v, want %v and the running review's checkout kept", rmErr, tt.err)
+				}
+			}
+		})
+	}
+}
+
+// The code of a continued session survives what would otherwise delete it: a late outcome from the
+// review's own run, and an api restart. A second continue waits for the first download.
+func TestContinuedCheckout(t *testing.T) {
+	ended := Review{ID: 4, Repo: "o/r", HeadSHA: "seen", Model: "haiku", Effort: "low", SessionID: "s4", Status: StatusDone}
+	st := &fakeStore{reviews: map[int64]Review{4: ended}, finished: map[int64]Outcome{4: {Status: StatusFailed}}}
+	dir := t.TempDir()
+	b := NewBroker(st, fakeGitHub{delay: 200 * time.Millisecond}, dir)
+	if s, err := b.Session(t.Context(), 4); err != nil || s != (Resume{SessionID: "s4", Model: "haiku", Effort: "low"}) {
+		t.Errorf("Session() = %+v, %v", s, err)
+	}
+
+	second := make(chan error, 1)
+	go func() {
+		time.Sleep(50 * time.Millisecond) // during the first download
+		_, err := b.PrepareContinue(t.Context(), 4)
+		second <- err
+	}()
+	got, err := b.PrepareContinue(t.Context(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-second; !errors.Is(err, ErrDownloading) {
+		t.Errorf("a second PrepareContinue() during the download = %v, want ErrDownloading", err)
+	}
+
+	// The review's run reports late: its outcome is dropped, and the code stays.
+	if err := b.Finish(t.Context(), 4, Outcome{Status: StatusDone}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(got.Dir); err != nil {
+		t.Fatal("a late Finish deleted the continued session's code")
+	}
+
+	// The api restarts: the code stays, and the worker's cleanup still deletes it after.
+	b = NewBroker(st, fakeGitHub{}, dir)
+	if err := os.MkdirAll(filepath.Join(dir, "8"), 0o755); err != nil { // a review interrupted while prepared
+		t.Fatal(err)
+	}
+	if err := b.RemoveCheckouts(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "8")); err == nil {
+		t.Error("RemoveCheckouts() kept an interrupted review's checkout")
+	}
+	if _, err := os.Stat(got.Dir); err != nil {
+		t.Fatal("an api restart deleted the continued session's code")
+	}
+	if err := b.RemoveCheckout(t.Context(), 4, got.Download); err != nil {
+		t.Fatal(err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("left after the session = %v", entries)
+	}
+
+	// A session that ended unseen a day ago: its code goes at the next restart.
+	if _, err := b.PrepareContinue(t.Context(), 4); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-continuedFor - time.Minute)
+	if err := os.Chtimes(filepath.Join(dir, "4"+continuedSuffix), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewBroker(st, fakeGitHub{}, dir).RemoveCheckouts(); err != nil {
+		t.Fatal(err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("left after a restart a day later = %v", entries)
 	}
 }

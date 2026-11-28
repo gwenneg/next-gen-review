@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,7 +20,8 @@ type fakeBroker struct {
 	stop      bool
 	progress  [2]int64 // the last report: id, tokens
 	finished  map[int64]review.Outcome
-	finishErr error // the outcome isn't stored
+	finishErr error    // the outcome isn't stored
+	removed   []string // the downloads deleted
 }
 
 func (f *fakeBroker) Wake() {}
@@ -37,6 +40,19 @@ func (f *fakeBroker) Finish(_ context.Context, id int64, o review.Outcome) error
 	return f.finishErr
 }
 func (f *fakeBroker) WorkerConnected() bool { return true }
+func (f *fakeBroker) Session(_ context.Context, id int64) (review.Resume, error) {
+	return review.Resume{SessionID: "s", Model: "haiku", Effort: "low"}, nil
+}
+func (f *fakeBroker) PrepareContinue(_ context.Context, id int64) (review.Resume, error) {
+	if id != 3 {
+		return review.Resume{}, review.ErrActive
+	}
+	return review.Resume{SessionID: "s", Model: "haiku", Effort: "low", Dir: "/checkouts/3", Download: "d&1"}, nil
+}
+func (f *fakeBroker) RemoveCheckout(_ context.Context, id int64, download string) error {
+	f.removed = append(f.removed, download)
+	return nil
+}
 
 // The worker's client and the api's internal handlers agree on paths, statuses and JSON.
 func TestAPI(t *testing.T) {
@@ -62,6 +78,20 @@ func TestAPI(t *testing.T) {
 	o := review.Outcome{Status: review.StatusDone, Result: "## Findings", Error: "", Tokens: 1500}
 	if err := api.Finish(ctx, 3, o); err != nil || b.finished[3] != o {
 		t.Errorf("Finish() = %v, broker got %+v; want %+v", err, b.finished[3], o)
+	}
+
+	if got, err := api.Session(ctx, 3); err != nil || got != (review.Resume{SessionID: "s", Model: "haiku", Effort: "low"}) {
+		t.Errorf("Session() = %+v, %v", got, err)
+	}
+	want := review.Resume{SessionID: "s", Model: "haiku", Effort: "low", Dir: "/checkouts/3", Download: "d&1"}
+	if got, err := api.Continue(ctx, 3); err != nil || got != want {
+		t.Errorf("Continue() = %+v, %v; want %+v", got, err, want)
+	}
+	if _, err := api.Continue(ctx, 5); err == nil || !strings.Contains(err.Error(), "409 Conflict: the review is still active") {
+		t.Errorf("Continue() of a running review = %v, want the api's message", err)
+	}
+	if err := api.RemoveCheckout(ctx, 3, "d&1"); err != nil || !slices.Equal(b.removed, []string{"d&1"}) {
+		t.Errorf("RemoveCheckout() = %v, broker removed %v", err, b.removed)
 	}
 
 	b.finishErr = errors.New("database down")

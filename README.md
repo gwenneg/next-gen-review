@@ -87,6 +87,20 @@ Each PR in the list has a **Review** button. Pick the model (Sonnet by default),
 
 The worker stops a review right away if `claude` reports that it uses an API key instead of your subscription token, and it never passes API key variables to `claude`.
 
+### Follow-up questions
+
+A finished review shows a command to continue it in a terminal:
+
+```sh
+make continue REVIEW=12   # in the repo folder, with the stack running
+```
+
+It downloads the PR's code again, at the reviewed commit, and opens the review's claude session in the worker container, with the same read-only tools. Ask what you want, then quit claude (`/exit`): the code is deleted again. It uses your Claude subscription, and the session's earlier messages count again.
+
+- The first time, claude shows its own setup screens (theme, security notes).
+- For each review, claude first asks whether you trust the folder. Choose Yes: the review's flags still ignore the PR's settings, hooks, CLAUDE.md and MCP servers, and claude can only read files, in that folder only. It doesn't ask again for that review.
+- If you close the terminal without quitting claude, the session keeps running in the container. The next `make continue` of that review stops it first.
+
 ## Check your Claude token
 
 ```sh

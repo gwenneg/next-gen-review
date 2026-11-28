@@ -71,6 +71,7 @@ export function ReviewPanel({ pr, options, latest, workerConnected }: Props) {
           </div>
         </details>
       )}
+      {latest && !active && latest.tokensUsed > 0 && <ContinueHint id={latest.id} />}
       {!active && !open && options && (
         <button onClick={() => setOpen(true)}>{latest ? 'Review again' : 'Review'}</button>
       )}
@@ -84,6 +85,27 @@ export function ReviewPanel({ pr, options, latest, workerConnected }: Props) {
       )}
       {error && <p className="error">{error}</p>}
     </div>
+  )
+}
+
+// The command that opens a review's claude session again, in a terminal, for follow-up questions.
+function ContinueHint({ id }: { id: number }) {
+  const [copied, setCopied] = useState(false)
+  const command = `make continue REVIEW=${id}`
+  const copy = () =>
+    navigator.clipboard.writeText(command).then(
+      () => setCopied(true),
+      () => setCopied(false),
+    )
+  return (
+    <p className="meta">
+      Ask follow-up questions in a terminal, in the repo folder: <code>{command}</code>{' '}
+      <button onClick={copy}>{copied ? 'Copied' : 'Copy'}</button>
+      <br />
+      It downloads the code again and opens this review's claude session, with the same read-only tools. claude asks
+      whether you trust the folder: choose Yes, the review's flags still ignore the PR's settings, hooks, CLAUDE.md and
+      MCP servers. It uses your Claude subscription.
+    </p>
   )
 }
 
