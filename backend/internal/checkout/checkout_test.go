@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,13 @@ func tarball(t *testing.T, entries ...entry) *bytes.Buffer {
 	return &buf
 }
 
+// noise returns n bytes gzip can't shrink, so cutting the archive cuts the file's data.
+func noise(n int) []byte {
+	b := make([]byte, n)
+	_, _ = rand.NewChaCha8([32]byte{}).Read(b)
+	return b
+}
+
 func TestExtract(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -43,33 +51,44 @@ func TestExtract(t *testing.T) {
 		max     int64
 		err     string
 		files   map[string]string // expected files under dir
+		cut     bool              // the download stops halfway
 	}{
 		{"files without the top folder", []entry{
 			{name: "o-r-abc/", typ: tar.TypeDir},
 			{name: "o-r-abc/main.go", body: "package main", typ: tar.TypeReg},
 			{name: "o-r-abc/sub/a.txt", body: "a", typ: tar.TypeReg},
-		}, 1 << 20, "", map[string]string{"main.go": "package main", "sub/a.txt": "a"}},
+		}, 1 << 20, "", map[string]string{"main.go": "package main", "sub/a.txt": "a"}, false},
 		{"symlinks skipped", []entry{
 			{name: "o-r-abc/link", link: "/etc/passwd", typ: tar.TypeSymlink},
 			{name: "o-r-abc/a.txt", body: "a", typ: tar.TypeReg},
-		}, 1 << 20, "", map[string]string{"a.txt": "a"}},
+		}, 1 << 20, "", map[string]string{"a.txt": "a"}, false},
 		{"path escaping the folder refused", []entry{
 			{name: "o-r-abc/../../escape.txt", body: "x", typ: tar.TypeReg},
-		}, 1 << 20, "escape", nil},
+		}, 1 << 20, "escape", nil, false},
 		{"too large", []entry{
 			{name: "o-r-abc/big", body: "0123456789", typ: tar.TypeReg},
-		}, 5, "larger than", nil},
+		}, 5, "larger than", nil, false},
+		{"download cut off", []entry{
+			{name: "o-r-abc/big", body: string(noise(64 << 10)), typ: tar.TypeReg},
+		}, 1 << 20, "write big: unexpected EOF", nil, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			parent := t.TempDir()
 			dir := filepath.Join(parent, "src")
-			err := Extract(tarball(t, tt.entries...), dir, tt.max)
+			archive := tarball(t, tt.entries...)
+			if tt.cut {
+				archive.Truncate(archive.Len() / 2)
+			}
+			err := Extract(archive, dir, tt.max)
 			if (tt.err == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tt.err)) {
 				t.Fatalf("Extract() = %v, want error containing %q", err, tt.err)
 			}
 			if _, err := os.Stat(filepath.Join(parent, "escape.txt")); err == nil {
 				t.Error("a file was written outside the folder")
+			}
+			if err != nil {
+				return // the broker deletes the folder of a failed checkout
 			}
 			var got []string
 			_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, _ error) error {

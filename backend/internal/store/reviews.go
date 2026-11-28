@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -27,14 +28,6 @@ func scanReview(row pgx.CollectableRow) (review.Review, error) {
 		&r.Status, &r.CancelRequested, &r.SessionID, &r.TokensUsed, &r.Result, &r.Error, &r.CreatedAt, &r.StartedAt,
 		&r.FinishedAt)
 	return r, err
-}
-
-func (s *Store) one(ctx context.Context, sql string, args ...any) (review.Review, error) {
-	rows, err := s.pool.Query(ctx, sql, args...)
-	if err != nil {
-		return review.Review{}, err
-	}
-	return pgx.CollectExactlyOneRow(rows, scanReview)
 }
 
 // CreateReview queues a review of a PR from the queue, at the head commit the queue has for it.
@@ -109,8 +102,8 @@ func (s *Store) CancelRequested(ctx context.Context, id int64) (bool, error) {
 }
 
 // ReviewProgress stores a running review's token count and returns whether the worker must stop:
-// the user asked to cancel, or the review is no longer running (for example after an api restart
-// marked it failed), so its tokens would be spent for nothing.
+// the user asked to cancel, or the review is no longer running (for example after the broker failed
+// it because the worker had stopped reporting), so its tokens would be spent for nothing.
 func (s *Store) ReviewProgress(ctx context.Context, id int64, tokens int) (stop bool, err error) {
 	err = s.pool.QueryRow(ctx, `UPDATE reviews SET tokens_used = $2 WHERE id = $1
 		RETURNING cancel_requested OR status <> 'running'`, id, tokens).Scan(&stop)
@@ -133,12 +126,13 @@ func (s *Store) CancelReview(ctx context.Context, id int64) (bool, error) {
 		WHERE id = $1 AND status IN ('queued', 'preparing', 'running')`, id)
 }
 
-// FinishReview stores how a review ended.
+// FinishReview stores how a review ended. The texts come from claude and from file names in the
+// PR, so NUL bytes and invalid UTF-8, which Postgres refuses in text, are dropped or replaced.
 func (s *Store) FinishReview(ctx context.Context, id int64, o review.Outcome) error {
 	changed, err := s.update(ctx, `UPDATE reviews SET status = $2, result = $3, error = $4, tokens_used = $5,
-		finished_at = now() WHERE id = $1 AND status IN ('preparing', 'running')`, id, o.Status, o.Result, o.Error, o.Tokens)
+		finished_at = now() WHERE id = $1 AND status IN ('preparing', 'running')`, id, o.Status, text(o.Result), text(o.Error), o.Tokens)
 	if err == nil && !changed {
-		return fmt.Errorf("review %d is not active", id)
+		return fmt.Errorf("review %d: %w", id, review.ErrNotActive)
 	}
 	return err
 }
@@ -157,11 +151,26 @@ func (s *Store) update(ctx context.Context, sql string, args ...any) (changed bo
 	return changed && err == nil, err
 }
 
-// FailInterruptedReviews marks reviews that were preparing or running when the api stopped.
+// text makes s storable in a Postgres text column.
+func text(s string) string {
+	return strings.ToValidUTF8(strings.ReplaceAll(s, "\x00", ""), "\uFFFD")
+}
+
+// FailInterruptedReviews fails the reviews the api was preparing when it stopped. The running ones
+// are the worker's: the broker adopts them (see RunningReviews).
 func (s *Store) FailInterruptedReviews(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `UPDATE reviews SET status = 'failed', error = 'interrupted: the api restarted',
-		finished_at = now() WHERE status IN ('preparing', 'running')`)
+		finished_at = now() WHERE status = 'preparing'`)
 	return err
+}
+
+// RunningReviews returns the ids of the running reviews.
+func (s *Store) RunningReviews(ctx context.Context) ([]int64, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id FROM reviews WHERE status = 'running' ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[int64])
 }
 
 // notify tells the pages about a short-lived change without storing an event.

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -21,7 +22,12 @@ type fakeStore struct {
 	canceled bool // the user canceled while the review was being prepared
 	prompt   string
 	finished map[int64]Outcome
+	failures int // FinishReview calls to fail, as when the database is down
+	calls    int // FinishReview calls
+	running  []int64
 }
+
+func (f *fakeStore) RunningReviews(context.Context) ([]int64, error) { return f.running, nil }
 
 func (f *fakeStore) ClaimReview(context.Context) (Review, bool, error) {
 	f.mu.Lock()
@@ -56,6 +62,14 @@ func (f *fakeStore) FinishReview(ctx context.Context, id int64, o Outcome) error
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.calls++
+	if f.failures > 0 {
+		f.failures--
+		return errors.New("connection lost")
+	}
+	if _, ok := f.finished[id]; ok {
+		return ErrNotActive
+	}
 	f.finished[id] = o
 	return nil
 }
@@ -66,8 +80,9 @@ func (f *fakeStore) outcome(id int64) Outcome {
 }
 
 type fakeGitHub struct {
-	err   error
-	delay time.Duration // a slow download
+	err    error
+	delay  time.Duration // a slow download
+	cutOff bool          // the download stops halfway through a file
 }
 
 func (f fakeGitHub) PullRequest(_ context.Context, repo string, number int, sha string) (PR, error) {
@@ -80,6 +95,12 @@ func (f fakeGitHub) Tarball(context.Context, string, string) (io.ReadCloser, err
 	tw := tar.NewWriter(gz)
 	_ = tw.WriteHeader(&tar.Header{Name: "o-r-abc/main.go", Typeflag: tar.TypeReg, Mode: 0o644, Size: 2})
 	_, _ = tw.Write([]byte("go"))
+	if f.cutOff { // big.bin is created, then its data stops
+		_ = tw.WriteHeader(&tar.Header{Name: "o-r-abc/big.bin", Typeflag: tar.TypeReg, Mode: 0o644, Size: 1 << 20})
+		_, _ = tw.Write(make([]byte, 100))
+		_ = gz.Close()
+		return io.NopCloser(&buf), nil
+	}
 	_ = tw.Close()
 	_ = gz.Close()
 	return io.NopCloser(&buf), nil
@@ -111,6 +132,7 @@ func TestBroker(t *testing.T) {
 	}{
 		{"prepared", fakeGitHub{}, false, true, ""},
 		{"GitHub fails", fakeGitHub{err: errors.New("HTTP 502")}, false, false, StatusFailed},
+		{"download cut off", fakeGitHub{cutOff: true}, false, false, StatusFailed},
 		{"canceled while preparing", fakeGitHub{}, true, false, StatusCanceled},
 		{"canceled, then GitHub fails", fakeGitHub{err: errors.New("HTTP 502")}, true, false, StatusCanceled},
 	}
@@ -230,17 +252,104 @@ func TestBrokerLostJob(t *testing.T) {
 	}
 }
 
-// Interrupted reviews leave checkouts behind; the api removes them at startup.
-func TestRemoveCheckouts(t *testing.T) {
-	b := NewBroker(&fakeStore{}, fakeGitHub{}, t.TempDir())
-	if err := os.MkdirAll(filepath.Join(b.checkouts, "3", "src"), 0o755); err != nil {
+// An outcome the database refused is stored once it's back, instead of the review staying
+// running forever. One for a review that already ended isn't retried.
+func TestBrokerFinishRetries(t *testing.T) {
+	st := &fakeStore{}
+	b := startBroker(t, st, fakeGitHub{}, 100*time.Millisecond)
+	if _, ok, err := b.Next(t.Context(), time.Second); !ok || err != nil {
+		t.Fatalf("Next() = %v, %v", ok, err)
+	}
+	st.mu.Lock()
+	st.failures = 2
+	st.mu.Unlock()
+	if err := b.Finish(t.Context(), 1, Outcome{Status: StatusDone, Result: "ok"}); err == nil {
+		t.Error("Finish() = nil, want the error: the worker retries too")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for st.outcome(1).Status == "" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if o := st.outcome(1); o.Status != StatusDone || o.Result != "ok" {
+		t.Fatalf("outcome = %+v, want the worker's", o)
+	}
+
+	if err := b.Finish(t.Context(), 1, Outcome{Status: StatusFailed}); err != nil {
+		t.Errorf("Finish() of an ended review = %v, want nil: there's nothing to retry", err)
+	}
+	st.mu.Lock()
+	calls := st.calls
+	st.mu.Unlock()
+	time.Sleep(200 * time.Millisecond) // several retry rounds
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.calls != calls || st.finished[1].Status != StatusDone {
+		t.Errorf("an ended review's outcome was retried: %d calls after %d, outcome %+v", st.calls, calls, st.finished[1])
+	}
+}
+
+// An outcome the database keeps refusing is replaced by a plain failure, so the review ends.
+func TestBrokerGivesUpOnRefusedOutcome(t *testing.T) {
+	st := &fakeStore{}
+	b := startBroker(t, st, fakeGitHub{}, 100*time.Millisecond)
+	b.maxTries = 3
+	if _, ok, err := b.Next(t.Context(), time.Second); !ok || err != nil {
+		t.Fatalf("Next() = %v, %v", ok, err)
+	}
+	st.mu.Lock()
+	st.failures = 3
+	st.mu.Unlock()
+	_ = b.Finish(t.Context(), 1, Outcome{Status: StatusDone, Result: "refused", Tokens: 40})
+	deadline := time.Now().Add(2 * time.Second)
+	for st.outcome(1).Status == "" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if o := st.outcome(1); o != (Outcome{Status: StatusFailed, Error: "the database refused the review's outcome", Tokens: 40}) {
+		t.Errorf("outcome = %+v, want a plain failure with the tokens", o)
+	}
+}
+
+// After an api restart, the reviews that were running are the worker's: their checkouts stay, and
+// one the worker reports on goes on. The others leave checkouts behind, which are deleted.
+func TestAdopt(t *testing.T) {
+	st := &fakeStore{running: []int64{5, 6}, finished: map[int64]Outcome{}}
+	b := NewBroker(st, fakeGitHub{}, t.TempDir())
+	b.jobTimeout = 100 * time.Millisecond
+	for _, dir := range []string{"3", "5", "6", "junk"} {
+		if err := os.MkdirAll(filepath.Join(b.checkouts, dir, "src"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.Adopt(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.RemoveCheckouts(); err != nil {
 		t.Fatal(err)
 	}
-	if entries, _ := os.ReadDir(b.checkouts); len(entries) != 0 {
-		t.Errorf("checkouts left: %v", entries)
+	var left []string
+	entries, _ := os.ReadDir(b.checkouts)
+	for _, e := range entries {
+		left = append(left, e.Name())
+	}
+	if !slices.Equal(left, []string{"5", "6"}) {
+		t.Errorf("checkouts left = %v, want the running reviews'", left)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go b.Run(ctx)
+	for range 10 { // the worker reports on 5, not on 6
+		time.Sleep(30 * time.Millisecond)
+		_, _ = b.Progress(t.Context(), 5, 10)
+	}
+	if o := st.outcome(6); o.Error != "the worker stopped responding" {
+		t.Errorf("review 6 = %+v, want failed: the worker doesn't run it", o)
+	}
+	if o := st.outcome(5); o.Status != "" {
+		t.Errorf("review 5 = %+v, want it still running", o)
+	}
+	if err := b.Finish(t.Context(), 5, Outcome{Status: StatusDone}); err != nil || st.outcome(5).Status != StatusDone {
+		t.Errorf("Finish(5) = %v, outcome %+v; want done", err, st.outcome(5))
 	}
 }
 

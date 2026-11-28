@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/gwenneg/next-gen-review/backend/internal/github"
 )
@@ -70,5 +71,41 @@ func TestPoll(t *testing.T) {
 	}
 	if p.Status().RefreshedAt == nil {
 		t.Error("RefreshedAt not set after a successful poll")
+	}
+}
+
+// pollSource tells the test about each poll.
+type pollSource struct{ polls chan struct{} }
+
+func (p pollSource) Queue(context.Context, []string) ([]github.PullRequest, error) {
+	p.polls <- struct{}{}
+	return nil, nil
+}
+
+// Run polls at once, then again on Wake without waiting for the interval, until ctx ends.
+func TestRun(t *testing.T) {
+	src := pollSource{make(chan struct{})}
+	p := NewPoller(src, &fakeStore{}, time.Hour)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { p.Run(ctx); close(done) }()
+	for _, step := range []string{"at start", "after Wake"} {
+		select {
+		case <-src.polls:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("no poll %s", step)
+		}
+		p.Wake()
+		p.Wake() // a second wake doesn't block
+	}
+	cancel()
+	go func() { // the poll the last wakes started may still be running
+		for range src.polls {
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run didn't stop with its context")
 	}
 }

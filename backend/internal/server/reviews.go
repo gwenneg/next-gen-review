@@ -25,7 +25,7 @@ type Broker interface {
 	Wake()
 	Next(ctx context.Context, wait time.Duration) (review.Job, bool, error)
 	Progress(ctx context.Context, id int64, tokens int) (bool, error)
-	Finish(ctx context.Context, id int64, o review.Outcome)
+	Finish(ctx context.Context, id int64, o review.Outcome) error
 	WorkerConnected() bool
 }
 
@@ -142,7 +142,11 @@ func NewInternal(b Broker) http.Handler {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		b.Finish(r.Context(), id, o)
+		if err := b.Finish(r.Context(), id, o); err != nil {
+			// The broker retries, and so does the worker: an api restart would lose the broker's copy.
+			writeError(w, http.StatusServiceUnavailable, "the outcome isn't stored yet: "+err.Error())
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 	return mux

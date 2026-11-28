@@ -2,8 +2,10 @@ package review
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,6 +26,9 @@ const (
 	// jobTimeout is how long a running review can go without a progress report before it counts
 	// as lost. The worker reports every 2s while a review runs.
 	jobTimeout = 2 * time.Minute
+	// maxFinishTries is how many times the broker tries to store an outcome. Then it stores a plain
+	// failure instead, in case the database refuses the outcome itself.
+	maxFinishTries = 10
 )
 
 // Store is the part of store.Store the broker uses.
@@ -33,6 +38,7 @@ type Store interface {
 	StartReview(ctx context.Context, id int64, prompt string) (bool, error)
 	ReviewProgress(ctx context.Context, id int64, tokens int) (stop bool, err error)
 	FinishReview(ctx context.Context, id int64, o Outcome) error
+	RunningReviews(ctx context.Context) ([]int64, error)
 }
 
 // GitHub is the part of github.Client the broker uses.
@@ -55,28 +61,60 @@ type Broker struct {
 	ready      chan Job      // a prepared review, waiting for the worker
 	stopped    chan struct{} // closed when Run returns
 	jobTimeout time.Duration
+	maxTries   int // maxFinishTries, shorter in tests
 
 	mu       sync.Mutex
 	calls    int                 // the worker's calls in progress, such as a long poll
 	lastCall time.Time           // when the worker's latest call ended
 	jobs     map[int64]time.Time // running reviews, with the worker's latest report on each
+	unsaved  map[int64]unsaved   // outcomes the store refused, retried by failLostJobs
+}
+
+// unsaved is an outcome the store refused, and how many times.
+type unsaved struct {
+	o     Outcome
+	tries int
 }
 
 // NewBroker returns a broker that writes checkouts under dir.
 func NewBroker(st Store, gh GitHub, dir string) *Broker {
 	// lastCall starts now: after an api restart, the worker retries within 5s.
 	return &Broker{store: st, gh: gh, checkouts: dir, wake: make(chan struct{}, 1), ready: make(chan Job),
-		stopped: make(chan struct{}), jobTimeout: jobTimeout, lastCall: time.Now(), jobs: map[int64]time.Time{}}
+		stopped: make(chan struct{}), jobTimeout: jobTimeout, maxTries: maxFinishTries, lastCall: time.Now(),
+		jobs: map[int64]time.Time{}, unsaved: map[int64]unsaved{}}
 }
 
-// RemoveCheckouts deletes every checkout. Call it at startup, after the interrupted reviews were
-// marked failed: no review is active then, and an interrupted one never deleted its checkout.
+// Adopt tracks the reviews that were running when the api restarted. The worker may still be
+// running them: it reports on them and finishes them as usual, and the ones it doesn't report on
+// are failed after jobTimeout. Call it at startup, before RemoveCheckouts.
+func (b *Broker) Adopt(ctx context.Context) error {
+	ids, err := b.store.RunningReviews(ctx)
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, id := range ids {
+		b.jobs[id] = time.Now()
+	}
+	return nil
+}
+
+// RemoveCheckouts deletes the checkouts that no running review needs. Call it at startup, after
+// Adopt: a review that was interrupted while being prepared never deleted its checkout.
 func (b *Broker) RemoveCheckouts() error {
 	entries, err := os.ReadDir(b.checkouts)
 	if err != nil {
 		return err
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	for _, e := range entries {
+		if id, err := strconv.ParseInt(e.Name(), 10, 64); err == nil {
+			if _, running := b.jobs[id]; running {
+				continue
+			}
+		}
 		if err := os.RemoveAll(filepath.Join(b.checkouts, e.Name())); err != nil {
 			return err
 		}
@@ -248,7 +286,8 @@ func (b *Broker) Progress(ctx context.Context, id int64, tokens int) (bool, erro
 }
 
 // failLostJobs fails the running reviews the worker stopped reporting on: it crashed, or never
-// got the job because its request had already ended. Nobody else would finish them.
+// got the job because its request had already ended. Nobody else would finish them. It also
+// stores again the outcomes the store refused, for example while the database was down.
 func (b *Broker) failLostJobs(ctx context.Context) {
 	t := time.NewTicker(b.jobTimeout / 4)
 	defer t.Stop()
@@ -265,27 +304,48 @@ func (b *Broker) failLostJobs(ctx context.Context) {
 				lost = append(lost, id)
 			}
 		}
+		unsaved := maps.Clone(b.unsaved)
 		b.mu.Unlock()
 		for _, id := range lost {
 			slog.Warn("the worker stopped reporting on a review", "review", id)
 			b.Finish(ctx, id, Outcome{Status: StatusFailed, Error: "the worker stopped responding"})
 		}
+		for id, u := range unsaved {
+			b.Finish(ctx, id, u.o)
+		}
 	}
 }
 
 // Finish stores the outcome and deletes the checkout. The claude transcript stays in the worker's
-// volume. It doesn't use ctx's cancellation: a review whose outcome isn't stored would stay active
-// and block new reviews of its PR.
-func (b *Broker) Finish(ctx context.Context, id int64, o Outcome) {
+// volume. A review whose outcome isn't stored would stay active and block new reviews of its PR,
+// so Finish doesn't use ctx's cancellation, and failLostJobs retries an outcome the store refused.
+// The error says the outcome isn't stored yet; an outcome for a review that already ended is
+// dropped, with no error.
+func (b *Broker) Finish(ctx context.Context, id int64, o Outcome) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	b.mu.Lock()
-	delete(b.jobs, id)
-	b.mu.Unlock()
-	if err := b.store.FinishReview(ctx, id, o); err != nil {
+	err := b.store.FinishReview(ctx, id, o)
+	if err != nil {
 		slog.Warn("finish review", "review", id, "error", err)
 	}
+	if errors.Is(err, ErrNotActive) {
+		err = nil
+	}
+	b.mu.Lock()
+	delete(b.jobs, id)
+	if err == nil {
+		delete(b.unsaved, id)
+	} else {
+		u := b.unsaved[id]
+		u.o, u.tries = o, u.tries+1
+		if u.tries >= b.maxTries {
+			u.o = Outcome{Status: StatusFailed, Error: "the database refused the review's outcome", Tokens: o.Tokens}
+		}
+		b.unsaved[id] = u
+	}
+	b.mu.Unlock()
 	if err := os.RemoveAll(filepath.Join(b.checkouts, strconv.FormatInt(id, 10))); err != nil {
 		slog.Warn("delete checkout", "review", id, "error", err)
 	}
+	return err
 }
