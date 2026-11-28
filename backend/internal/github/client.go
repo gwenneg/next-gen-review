@@ -19,6 +19,10 @@ type Client struct {
 	token string
 	gql   *api.GraphQLClient
 	rest  *api.RESTClient
+	diff  *api.RESTClient // asks for diffs instead of JSON
+	// tarball has no overall timeout: go-gh's Timeout also covers reading the body, and a large
+	// repo takes longer than 30s to download. The caller's context limits it.
+	tarball *api.RESTClient
 }
 
 // NewClient returns a client for github.com. An empty token is allowed: every call then fails
@@ -27,8 +31,12 @@ func NewClient(token string) (*Client, error) {
 	return newClient(token, nil)
 }
 
-// retryWaitMin is the first wait before retrying a failed GitHub call. Tests shorten it.
-var retryWaitMin = time.Second
+// retryWaitMin is the first wait before retrying a failed GitHub call, and requestTimeout the
+// longest a call may take, reading the response included. Tests shorten them.
+var (
+	retryWaitMin   = time.Second
+	requestTimeout = 30 * time.Second
+)
 
 // newClient lets tests send the requests to a fake server. GitHub's temporary errors (5xx, 429,
 // network errors) are retried by go-retryablehttp.
@@ -40,7 +48,7 @@ func newClient(token string, transport http.RoundTripper) (*Client, error) {
 	if transport != nil {
 		retry.HTTPClient.Transport = transport
 	}
-	opts := api.ClientOptions{Host: "github.com", AuthToken: token, Timeout: 30 * time.Second,
+	opts := api.ClientOptions{Host: "github.com", AuthToken: token, Timeout: requestTimeout,
 		Transport: &retryablehttp.RoundTripper{Client: retry}}
 	if token == "" {
 		opts.AuthToken = "unset" // go-gh would otherwise look for gh's own config
@@ -53,7 +61,18 @@ func newClient(token string, transport http.RoundTripper) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{token: token, gql: gql, rest: rest}, nil
+	noTimeout := opts
+	noTimeout.Timeout = 0
+	tarball, err := api.NewRESTClient(noTimeout)
+	if err != nil {
+		return nil, err
+	}
+	opts.Headers = map[string]string{"Accept": "application/vnd.github.diff"}
+	diff, err := api.NewRESTClient(opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{token: token, gql: gql, rest: rest, diff: diff, tarball: tarball}, nil
 }
 
 var errNoToken = errors.New("no GitHub token: set GH_TOKEN or GITHUB_TOKEN")

@@ -18,13 +18,16 @@ import (
 	"github.com/gwenneg/next-gen-review/backend/internal/events"
 	"github.com/gwenneg/next-gen-review/backend/internal/github"
 	"github.com/gwenneg/next-gen-review/backend/internal/queue"
+	"github.com/gwenneg/next-gen-review/backend/internal/review"
 	"github.com/gwenneg/next-gen-review/backend/internal/server"
 	"github.com/gwenneg/next-gen-review/backend/internal/store"
 )
 
 const (
 	addr         = ":8080"
+	internalAddr = ":8081" // the worker's API, reachable only on the Compose network
 	pollInterval = 2 * time.Minute
+	checkouts    = "/checkouts" // shared with the worker, which mounts it read-only
 )
 
 func main() {
@@ -64,11 +67,23 @@ func run() error {
 	go hub.Listen(ctx)
 	go poller.Run(ctx)
 
-	handler := server.New(server.Deps{DB: pool, Store: st, Poller: poller, Repos: gh, Events: hub, TokenSource: source})
+	if err := st.FailInterruptedReviews(ctx); err != nil {
+		return err
+	}
+	broker := review.NewBroker(st, gh, checkouts)
+	if err := broker.RemoveCheckouts(); err != nil {
+		return err
+	}
+	go broker.Run(ctx)
+
+	handler := server.New(server.Deps{DB: pool, Store: st, Poller: poller, Repos: gh, Events: hub, TokenSource: source,
+		Reviews: st, Broker: broker})
 	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
-	errc := make(chan error, 1)
+	internal := &http.Server{Addr: internalAddr, Handler: server.NewInternal(broker), ReadHeaderTimeout: 10 * time.Second}
+	errc := make(chan error, 2)
 	go func() { errc <- srv.ListenAndServe() }()
-	slog.Info("api listening", "addr", addr)
+	go func() { errc <- internal.ListenAndServe() }()
+	slog.Info("api listening", "addr", addr, "internal", internalAddr)
 
 	select {
 	case err := <-errc:
@@ -77,6 +92,7 @@ func run() error {
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	_ = internal.Shutdown(shutdownCtx)
 	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

@@ -50,11 +50,13 @@ type Subscriber interface {
 
 // Deps are what the handlers need.
 type Deps struct {
-	DB     Pinger
-	Store  Store
-	Poller Poller
-	Repos  RepoChecker
-	Events Subscriber
+	DB      Pinger
+	Store   Store
+	Poller  Poller
+	Repos   RepoChecker
+	Events  Subscriber
+	Reviews ReviewStore
+	Broker  Broker
 	// TokenSource names the variable the GitHub token came from, shown on the page.
 	TokenSource string
 }
@@ -72,6 +74,10 @@ func New(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/watched-repos", d.watchedRepos)
 	mux.HandleFunc("POST /api/watched-repos", d.addWatchedRepo)
 	mux.HandleFunc("DELETE /api/watched-repos/{owner}/{name}", d.removeWatchedRepo)
+	mux.HandleFunc("GET /api/review-options", d.reviewOptions)
+	mux.HandleFunc("GET /api/reviews", d.reviews)
+	mux.HandleFunc("POST /api/reviews", d.startReview)
+	mux.HandleFunc("POST /api/reviews/{id}/cancel", d.cancelReview)
 	// CrossOriginProtection rejects POST and DELETE requests sent by pages on other sites (CSRF).
 	return localOnly(http.NewCrossOriginProtection().Handler(mux))
 }

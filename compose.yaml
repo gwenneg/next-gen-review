@@ -30,6 +30,8 @@ services:
       PGSSLMODE: disable
       GH_TOKEN: ${GH_TOKEN:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    volumes:
+      - checkouts:/checkouts
     depends_on:
       db:
         condition: service_healthy
@@ -39,13 +41,21 @@ services:
       timeout: 5s
       retries: 12
 
-  # Holds the Claude token only. It never gets the GitHub token or the database password.
+  # Holds the Claude token only. It never gets the GitHub token or the database password: it gets
+  # its jobs from the api's internal port (8081, not published) and the code from a read-only volume.
   worker:
     build:
       context: ./backend
       target: worker
     environment:
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      API_INTERNAL_URL: http://api:8081
+    volumes:
+      - checkouts:/checkouts:ro
+      - claude-data:/claude-data
+    depends_on:
+      api:
+        condition: service_healthy
 
   web:
     build:
@@ -59,3 +69,5 @@ services:
 
 volumes:
   db-data:
+  checkouts:
+  claude-data:

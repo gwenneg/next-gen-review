@@ -1,4 +1,5 @@
-import type { PullRequest, QueueResponse, Reason } from './api'
+import type { PullRequest, QueueResponse, Reason, Review, ReviewOptions } from './api'
+import { ReviewPanel } from './ReviewPanel'
 
 const ago = new Intl.RelativeTimeFormat('en', { numeric: 'auto' })
 
@@ -37,7 +38,9 @@ const ciText: Record<string, string> = {
   EXPECTED: 'CI waiting',
 }
 
-function Row({ pr }: { pr: PullRequest }) {
+type RowProps = { pr: PullRequest; options?: ReviewOptions; latest?: Review; workerConnected: boolean }
+
+function Row({ pr, options, latest, workerConnected }: RowProps) {
   return (
     <li className="pr">
       <div>
@@ -69,18 +72,22 @@ function Row({ pr }: { pr: PullRequest }) {
           </span>
         ))}
       </div>
+      <ReviewPanel pr={pr} options={options} latest={latest} workerConnected={workerConnected} />
     </li>
   )
 }
 
 type Props = {
   queue?: QueueResponse
+  reviewOptions?: ReviewOptions
+  latestReviews: Map<string, Review> // by PR id
+  workerConnected: boolean
   loadError?: string
   refreshing: boolean
   onRefresh: () => void
 }
 
-export function Queue({ queue, loadError, refreshing, onRefresh }: Props) {
+export function Queue({ queue, reviewOptions, latestReviews, workerConnected, loadError, refreshing, onRefresh }: Props) {
   const status = queue?.status
   return (
     <section>
@@ -98,7 +105,15 @@ export function Queue({ queue, loadError, refreshing, onRefresh }: Props) {
       {status?.error && <p className="error">Last GitHub check failed: {status.error}</p>}
       {queue && queue.items.length === 0 && !status?.error && <p>Nothing is waiting for you.</p>}
       <ul className="prs">
-        {queue?.items.map((pr) => <Row key={pr.id} pr={pr} />)}
+        {queue?.items.map((pr) => (
+          <Row
+            key={pr.id}
+            pr={pr}
+            options={reviewOptions}
+            latest={latestReviews.get(pr.id)}
+            workerConnected={workerConnected}
+          />
+        ))}
       </ul>
     </section>
   )
