@@ -30,6 +30,7 @@ services:
       PGSSLMODE: disable
       GH_TOKEN: ${GH_TOKEN:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GH_REVIEW_TOKEN: ${GH_REVIEW_TOKEN:-}
     volumes:
       - checkouts:/checkouts
     depends_on:

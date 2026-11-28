@@ -148,7 +148,7 @@ func TestReviewLifecycle(t *testing.T) {
 	if _, ok, err := s.ClaimReview(ctx); ok || err != nil {
 		t.Errorf("ClaimReview() with nothing queued = %v, %v; want false", ok, err)
 	}
-	if started, err := s.StartReview(ctx, r.ID, "the prompt"); !started || err != nil {
+	if started, err := s.StartReview(ctx, r.ID, "the prompt", nil); !started || err != nil {
 		t.Fatalf("StartReview() = %v, %v", started, err)
 	}
 	if stop, err := s.ReviewProgress(ctx, r.ID, 500); stop || err != nil {
@@ -226,7 +226,7 @@ func TestCancelReview(t *testing.T) {
 	if c, err := s.CancelRequested(ctx, r.ID); !c || err != nil {
 		t.Errorf("CancelRequested() = %v, %v; want true", c, err)
 	}
-	if started, err := s.StartReview(ctx, r.ID, "prompt"); started || err != nil {
+	if started, err := s.StartReview(ctx, r.ID, "prompt", nil); started || err != nil {
 		t.Errorf("StartReview(canceled) = %v, %v; want false", started, err)
 	}
 
@@ -236,7 +236,7 @@ func TestCancelReview(t *testing.T) {
 	}
 	r, _ = s.CreateReview(ctx, request)
 	_, _, _ = s.ClaimReview(ctx)
-	_, _ = s.StartReview(ctx, r.ID, "prompt")
+	_, _ = s.StartReview(ctx, r.ID, "prompt", nil)
 	if ok, err := s.CancelReview(ctx, r.ID); !ok || err != nil {
 		t.Fatalf("CancelReview(running) = %v, %v", ok, err)
 	}
@@ -265,7 +265,7 @@ func setUp(t *testing.T, s *Store) (running, preparing, queued review.Review) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := s.StartReview(ctx, running.ID, "prompt"); err != nil {
+	if _, err := s.StartReview(ctx, running.ID, "prompt", nil); err != nil {
 		t.Fatal(err)
 	}
 	return running, preparing, queued
@@ -302,7 +302,7 @@ func TestReviewChangeNeedsItsEvent(t *testing.T) {
 	if _, _, err := s.ClaimReview(ctx); err == nil {
 		t.Error("ClaimReview() succeeded without its event")
 	}
-	if _, err := s.StartReview(ctx, preparing.ID, "prompt"); err == nil {
+	if _, err := s.StartReview(ctx, preparing.ID, "prompt", nil); err == nil {
 		t.Error("StartReview() succeeded without its event")
 	}
 	if _, err := s.CancelReview(ctx, queued.ID); err == nil {

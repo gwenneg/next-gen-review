@@ -79,8 +79,21 @@ func run() error {
 	}
 	go broker.Run(ctx)
 
-	handler := server.New(server.Deps{DB: pool, Store: st, Poller: poller, Repos: gh, Events: hub, TokenSource: source,
-		Reviews: st, Broker: broker})
+	deps := server.Deps{DB: pool, Store: st, Poller: poller, Repos: gh, Events: hub, TokenSource: source,
+		Reviews: st, Broker: broker, Drafts: st}
+	// Posting reviews needs a token that can write them: GH_REVIEW_TOKEN, apart from the queue's.
+	if token := os.Getenv("GH_REVIEW_TOKEN"); token != "" {
+		poster, err := github.NewPoster(token)
+		if err != nil {
+			return err
+		}
+		deps.Poster = poster
+		if deps.PosterLogin, err = poster.Login(ctx); err != nil {
+			slog.Warn("GH_REVIEW_TOKEN: who it belongs to", "error", err)
+		}
+		slog.Info("posting reviews", "as", deps.PosterLogin)
+	}
+	handler := server.New(deps)
 	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	internal := &http.Server{Addr: internalAddr, Handler: server.NewInternal(broker), ReadHeaderTimeout: 10 * time.Second}
 	errc := make(chan error, 2)

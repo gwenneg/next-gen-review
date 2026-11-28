@@ -46,6 +46,7 @@ Without it, `docker compose` and `docker buildx` fail with "unknown command". Th
    - `POSTGRES_PASSWORD`: any value.
    - `GITHUB_TOKEN` (or `GH_TOKEN`, like the `gh` CLI): a fine-grained token with read-only access to public repositories, to list the PRs waiting for you. `.env.example` says how to create it. A `GH_TOKEN` or `GITHUB_TOKEN` exported in your shell wins over `.env`, so check that it's the token you mean: the page shows which variable it came from.
    - `CLAUDE_CODE_OAUTH_TOKEN`: the long-lived token of your Claude subscription, created with `claude setup-token`. Needed to run reviews.
+   - `GH_REVIEW_TOKEN` (optional): a GitHub token that can write PR reviews, to post a review's comments from the page. The queue's token stays read-only. A classic token with the `public_repo` scope works on every public repo, and a fine-grained one on the repos it's given "Pull requests: Read and write". Reviews are posted as this token's user.
 2. Start the stack and open http://127.0.0.1:8080:
    ```sh
    make dev   # hot reload, stays in the foreground
@@ -86,6 +87,17 @@ Each PR in the list has a **Review** button. Pick the model (Sonnet by default),
 4. The review appears under the PR. The code is deleted, and the Claude session is kept in the worker's volume.
 
 The worker stops a review right away if `claude` reports that it uses an API key instead of your subscription token, and it never passes API key variables to `claude`.
+
+### Post comments to GitHub
+
+A finished review also drafts comments for the PR author: a main comment, and inline comments that each start with a severity, such as `[High]`. Open **Comments for GitHub** under the review to edit, delete or add comments. Edits are saved when a field loses focus.
+
+When you're ready, pick the verdict (Comment, Approve or Request changes) and post. It's one GitHub review, at the commit the AI reviewed:
+
+- Comments on lines of the diff are posted inline. GitHub doesn't take inline comments on other lines, so those go in the main comment, under "Outside the diff", with their file and line.
+- Every comment ends with a line saying it was drafted with AI, reviewed and posted by the maintainer.
+- If the author pushed since the review, the page warns you, and GitHub shows the comments that no longer match the code as outdated.
+- Posting needs `GH_REVIEW_TOKEN`. Once posted, the comments can't change on the page.
 
 ### Follow-up questions
 

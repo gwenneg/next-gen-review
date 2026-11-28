@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ type fakeStore struct {
 	calls    int // FinishReview calls
 	running  []int64
 	reviews  map[int64]Review // for Review
+	lines    DiffLines        // from StartReview
 }
 
 func (f *fakeStore) RunningReviews(context.Context) ([]int64, error) { return f.running, nil }
@@ -55,10 +57,10 @@ func (f *fakeStore) cancel() {
 	defer f.mu.Unlock()
 	f.canceled = true
 }
-func (f *fakeStore) StartReview(_ context.Context, _ int64, prompt string) (bool, error) {
+func (f *fakeStore) StartReview(_ context.Context, _ int64, prompt string, lines DiffLines) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.prompt = prompt
+	f.prompt, f.lines = prompt, lines
 	return !f.canceled, nil
 }
 func (f *fakeStore) ReviewProgress(context.Context, int64, int) (bool, error) { return false, nil }
@@ -92,7 +94,8 @@ type fakeGitHub struct {
 }
 
 func (f fakeGitHub) PullRequest(_ context.Context, repo string, number int, sha string) (PR, error) {
-	return PR{Repo: repo, Number: number, HeadSHA: sha, Title: "Add retries", Diff: "diff"}, f.err
+	return PR{Repo: repo, Number: number, HeadSHA: sha, Title: "Add retries", Diff: "diff",
+		Lines: DiffLines{"main.go": {SideRight: {{1, 2}}}}}, f.err
 }
 func (f fakeGitHub) Tarball(context.Context, string, string) (io.ReadCloser, error) {
 	time.Sleep(f.delay)
@@ -164,6 +167,10 @@ func TestBroker(t *testing.T) {
 			}
 			if b, err := os.ReadFile(filepath.Join(job.Dir, "main.go")); err != nil || string(b) != "go" {
 				t.Errorf("checkout main.go = %q, %v", b, err)
+			}
+			// The diff's lines are stored for the review's comments.
+			if !reflect.DeepEqual(st.lines, DiffLines{"main.go": {SideRight: {{1, 2}}}}) {
+				t.Errorf("stored lines = %v, want the PR's", st.lines)
 			}
 			// The review covers the commit the user saw in the queue.
 			if !strings.Contains(st.prompt, "head commit seen") || job.Prompt != st.prompt {

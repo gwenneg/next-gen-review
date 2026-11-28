@@ -52,5 +52,6 @@ export const review = (over: Partial<Review> = {}): Review => ({
   createdAt: new Date().toISOString(),
   startedAt: null,
   finishedAt: null,
+  postedUrl: '',
   ...over,
 })

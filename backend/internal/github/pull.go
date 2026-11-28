@@ -1,10 +1,12 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -12,8 +14,14 @@ import (
 	"github.com/gwenneg/next-gen-review/backend/internal/review"
 )
 
-// maxDiff is how much of the diff goes in the prompt. Claude reads the files for the rest.
-const maxDiff = 200 << 10
+const (
+	// maxDiff is how much of the diff goes in the prompt. Claude reads the files for the rest.
+	maxDiff = 200 << 10
+)
+
+// maxDiffLines is how much of the diff is read to find the lines inline comments can be on. Tests
+// lower it.
+var maxDiffLines int64 = 64 << 20
 
 // PullRequest returns the PR's title, description and diff at the head commit sha, for the review
 // prompt. The diff matches the code at sha even if the author pushed since.
@@ -53,17 +61,40 @@ func (c *Client) PullRequest(ctx context.Context, repo string, number int, sha s
 		}
 		diffPath = compare
 	}
-	diff, truncated, err := c.read(ctx, c.diff, diffPath, maxDiff)
+	diff, cut, err := c.read(ctx, c.diff, diffPath, maxDiffLines)
 	// GitHub refuses the PR's diff past 300 files with 406, but compare still gives it.
 	var httpErr *api.HTTPError
 	if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotAcceptable && diffPath == path && compare != "" {
-		diff, truncated, err = c.read(ctx, c.diff, compare, maxDiff)
+		diff, cut, err = c.read(ctx, c.diff, compare, maxDiffLines)
 	}
 	if err != nil {
 		return review.PR{}, fmt.Errorf("get the diff of %s#%d: %w", repo, number, err)
 	}
-	return review.PR{Repo: repo, Number: number, HeadSHA: sha, Title: pr.Title, Body: pr.Body,
-		Diff: string(diff), DiffTruncated: truncated}, nil
+	// A diff cut mid-hunk doesn't parse: keep its complete files. Without the diff's lines, every
+	// comment goes in the review's main comment.
+	whole := diff
+	if cut {
+		whole = completeFiles(diff)
+	}
+	lines, err := review.ParseDiffLines(string(whole))
+	if err != nil {
+		slog.Warn("read the diff's lines: inline comments will go in the main comment", "pr", fmt.Sprintf("%s#%d", repo, number), "error", err)
+		lines = review.DiffLines{}
+	}
+	out := review.PR{Repo: repo, Number: number, HeadSHA: sha, Title: pr.Title, Body: pr.Body, Lines: lines,
+		Diff: string(diff), DiffTruncated: len(diff) > maxDiff}
+	if out.DiffTruncated {
+		out.Diff = string(diff[:maxDiff])
+	}
+	return out, nil
+}
+
+// completeFiles returns the files of a cut diff that end before the cut.
+func completeFiles(diff []byte) []byte {
+	if i := bytes.LastIndex(diff, []byte("\ndiff --git ")); i >= 0 {
+		return diff[:i+1]
+	}
+	return nil
 }
 
 // Tarball returns GitHub's gzipped tarball of the repo at a commit. The caller closes it.

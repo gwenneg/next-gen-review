@@ -56,8 +56,9 @@ type event struct {
 			Output        int `json:"output_tokens"`
 		} `json:"usage"`
 	} `json:"message"`
-	Result  string `json:"result"`
-	IsError bool   `json:"is_error"`
+	Result           string          `json:"result"`
+	IsError          bool            `json:"is_error"`
+	StructuredOutput json.RawMessage `json:"structured_output"` // the answer, checked against review.OutputSchema
 }
 
 var errTimeout = errors.New("the review took too long")
@@ -80,7 +81,8 @@ func (c Claude) Run(ctx context.Context, job review.Job, report Report) review.O
 	ctx, cancel := context.WithTimeoutCause(ctx, c.Timeout, errTimeout)
 	defer cancel()
 	args := append([]string{"-p"}, Flags(job.Model, job.Effort)...)
-	args = append(args, "--output-format", "stream-json", "--verbose", "--session-id", job.SessionID)
+	args = append(args, "--output-format", "stream-json", "--verbose", "--session-id", job.SessionID,
+		"--json-schema", review.OutputSchema)
 	cmd := exec.CommandContext(ctx, c.Bin, args...)
 	cmd.Dir, cmd.Env, cmd.Stdin = job.Dir, c.Env, strings.NewReader(job.Prompt)
 	stderr := &tail{max: 4096}
@@ -174,7 +176,17 @@ func (c Claude) Run(ctx context.Context, job review.Job, report Report) review.O
 	case stopStatus != "":
 		return review.Outcome{Status: stopStatus, Result: text, Error: stopNote, Tokens: tokens}
 	case result != nil && !result.IsError:
-		return review.Outcome{Status: review.StatusDone, Result: result.Result, Tokens: tokens}
+		var out review.Output
+		if err := json.Unmarshal(result.StructuredOutput, &out); err != nil || out.Review == "" {
+			// claude may give up on the schema: its last text is all there is, without drafts.
+			if strings.TrimSpace(result.Result) == "" {
+				return review.Outcome{Status: review.StatusFailed, Error: "claude returned no answer", Tokens: tokens}
+			}
+			return review.Outcome{Status: review.StatusDone, Result: result.Result, Tokens: tokens,
+				Error: "claude didn't return its answer in the expected format: no comments were drafted for GitHub"}
+		}
+		drafts := out.Drafts()
+		return review.Outcome{Status: review.StatusDone, Result: out.Review, Tokens: tokens, Drafts: &drafts}
 	case result != nil:
 		return review.Outcome{Status: review.StatusFailed, Result: text, Error: result.Result, Tokens: tokens}
 	case errors.Is(context.Cause(ctx), errTimeout):
