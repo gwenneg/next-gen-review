@@ -45,7 +45,7 @@ Without it, `docker compose` and `docker buildx` fail with "unknown command". Th
    ```
    - `POSTGRES_PASSWORD`: any value.
    - `GITHUB_TOKEN` (or `GH_TOKEN`, like the `gh` CLI): a fine-grained token with read-only access to public repositories, to list the PRs waiting for you. `.env.example` says how to create it. A `GH_TOKEN` or `GITHUB_TOKEN` exported in your shell wins over `.env`, so check that it's the token you mean: the page shows which variable it came from.
-   - `CLAUDE_CODE_OAUTH_TOKEN`: only needed for `make check-claude` for now.
+   - `CLAUDE_CODE_OAUTH_TOKEN`: the long-lived token of your Claude subscription, created with `claude setup-token`. Needed to run reviews.
 2. Start the stack and open http://127.0.0.1:8080:
    ```sh
    make dev   # hot reload, stays in the foreground
@@ -71,10 +71,21 @@ The api checks GitHub every 2 minutes, and when you click Refresh. The page upda
 |---|---|
 | `db` | Postgres. |
 | `api` | Go. HTTP API and WebSocket for live updates. Runs the database migrations at startup. |
-| `worker` | Go. Will run the AI reviews with the Claude CLI. It gets the Claude token and nothing else. |
+| `worker` | Go. Runs the AI reviews with the Claude CLI. It gets the Claude token and nothing else: its jobs come from the api's internal port, and the code from a read-only volume. |
 | `web` | React + TypeScript (Vite). Served by nginx, which also forwards `/api` to the api. |
 
 Only `web` is published, on `127.0.0.1:8080`. In dev mode, Postgres is also on `127.0.0.1:5433`.
+
+## Reviews
+
+Each PR in the list has a **Review** button. Pick the model (Sonnet by default), the effort, a token cap, and optionally some context for the AI, then start it. Reviews run one at a time, with your Claude subscription through the `claude` CLI, never the paid API:
+
+1. The api downloads the PR's code at the commit shown in the list, into a volume the worker can only read.
+2. The worker runs `claude -p` in that folder. Claude can only use Read, Grep and Glob, and can't read anything outside the folder.
+3. The page shows the progress and the token count (cache reads are not counted). Cancel stops the review at once, and so does reaching the cap.
+4. The review appears under the PR. The code is deleted, and the Claude session is kept in the worker's volume.
+
+The worker stops a review right away if `claude` reports that it uses an API key instead of your subscription token, and it never passes API key variables to `claude`.
 
 ## Check your Claude token
 

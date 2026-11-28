@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,18 +16,39 @@ import (
 )
 
 // fakeGitHub answers the viewer and search GraphQL queries, the latter by query string (with an
-// optional second page), and REST repository lookups by "owner/name".
+// optional second page), REST lookups under /repos/ by the rest of the path, and diffs by path.
 type fakeGitHub struct {
 	searches map[string][][]map[string]any // search query -> pages of nodes
-	repos    map[string]map[string]any     // "owner/name" -> REST repository
+	repos    map[string]map[string]any     // "owner/name" or "owner/name/pulls/1" -> REST JSON
+	diffs    map[string]string             // URL path -> diff, for requests that accept diffs
+	slow     map[string]string             // URL path -> body sent in two halves, 300ms apart
 	failures int                           // the first requests answered with 502
 	calls    *int
 }
+
+// tooLarge in diffs answers like GitHub for a PR past 300 files.
+const tooLarge = "406"
 
 func (f fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	*f.calls++
 	if *f.calls <= f.failures {
 		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	if body, ok := f.slow[r.URL.Path]; ok {
+		_, _ = w.Write([]byte(body[:len(body)/2]))
+		w.(http.Flusher).Flush()
+		time.Sleep(300 * time.Millisecond)
+		_, _ = w.Write([]byte(body[len(body)/2:]))
+		return
+	}
+	if diff, ok := f.diffs[r.URL.Path]; ok && strings.Contains(r.Header.Get("Accept"), "diff") {
+		if diff == tooLarge {
+			w.WriteHeader(http.StatusNotAcceptable)
+			_, _ = w.Write([]byte(`{"message":"Sorry, the diff exceeded the maximum number of files (300).","code":"too_large"}`))
+			return
+		}
+		_, _ = w.Write([]byte(diff))
 		return
 	}
 	if name, ok := strings.CutPrefix(r.URL.Path, "/repos/"); ok {
@@ -245,5 +267,63 @@ func TestPublicRepo(t *testing.T) {
 				t.Errorf("err = %T, want InvalidRepoError so the api answers 400", err)
 			}
 		})
+	}
+}
+
+// The diff matches the commit that is checked out, even after the author pushed to a fork.
+func TestPullRequestDiff(t *testing.T) {
+	pull := func(repo any) map[string]any {
+		return map[string]any{"title": "Fix", "body": "Body", "base": map[string]any{"ref": "main"},
+			"head": map[string]any{"sha": "new", "repo": repo}}
+	}
+	f := fakeGitHub{
+		repos: map[string]map[string]any{
+			"o/r/pulls/7": pull(map[string]any{"full_name": "fork/r"}),
+			"o/r/pulls/8": pull(nil), // the fork was deleted
+			"o/r/pulls/9": pull(map[string]any{"full_name": "fork/r"}),
+		},
+		diffs: map[string]string{
+			"/repos/o/r/pulls/7":                   "diff at new",
+			"/repos/o/r/compare/main...fork:r:old": "diff at old",
+			"/repos/o/r/pulls/9":                   tooLarge,
+			"/repos/o/r/compare/main...fork:r:new": "diff of 400 files",
+		},
+	}
+	c := newTestClient(t, f)
+	tests := []struct {
+		number    int
+		sha, want string
+	}{
+		{7, "new", "diff at new"},
+		{7, "old", "diff at old"}, // the author pushed since the queue was checked
+		{8, "old", ""},
+		{9, "new", "diff of 400 files"}, // GitHub refuses the PR's own diff
+	}
+	for _, tt := range tests {
+		pr, err := c.PullRequest(t.Context(), "o/r", tt.number, tt.sha)
+		if tt.want == "" {
+			if err == nil {
+				t.Errorf("#%d at %s: no error, want one: the commit can't be found", tt.number, tt.sha)
+			}
+			continue
+		}
+		if err != nil || pr.Diff != tt.want || pr.HeadSHA != tt.sha {
+			t.Errorf("#%d at %s = %q at %s, %v; want %q", tt.number, tt.sha, pr.Diff, pr.HeadSHA, err, tt.want)
+		}
+	}
+}
+
+// A large repo takes longer to download than the timeout of a GitHub call.
+func TestTarballOutlastsRequestTimeout(t *testing.T) {
+	requestTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { requestTimeout = 30 * time.Second })
+	c := newTestClient(t, fakeGitHub{slow: map[string]string{"/repos/o/r/tarball/abc": "0123456789"}})
+	body, err := c.Tarball(t.Context(), "o/r", "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	if b, err := io.ReadAll(body); err != nil || string(b) != "0123456789" {
+		t.Errorf("read %q, %v; want the whole tarball", b, err)
 	}
 }

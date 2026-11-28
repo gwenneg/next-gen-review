@@ -92,3 +92,29 @@ header {
 .error {
   color: #cf222e;
 }
+
+.review {
+  margin-top: 0.4rem;
+}
+
+.review-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1rem;
+  align-items: center;
+  margin-top: 0.4rem;
+  padding: 0.6rem;
+  border: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+  border-radius: 0.4rem;
+}
+
+.review-form .context {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+
+.markdown {
+  padding: 0 0.8rem;
+  border-left: 3px solid color-mix(in srgb, currentColor 20%, transparent);
+}

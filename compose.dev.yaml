@@ -6,11 +6,14 @@ services:
     ports:
       - "127.0.0.1:5433:5432"
 
+  # Dev containers run as root, the built ones don't: separate volumes keep file owners apart.
   api:
     image: next-gen-review-api:dev
     build:
       target: dev
     command: ["go", "run", "./cmd/api"]
+    volumes:
+      - checkouts-dev:/checkouts
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
       start_period: 60s
@@ -27,6 +30,9 @@ services:
     build:
       target: dev
     command: ["go", "run", "./cmd/worker"]
+    volumes:
+      - checkouts-dev:/checkouts:ro
+      - claude-data-dev:/claude-data
     develop:
       watch:
         - action: sync+restart
@@ -50,3 +56,7 @@ services:
             - node_modules/
         - action: rebuild
           path: ./frontend/package-lock.json
+
+volumes:
+  checkouts-dev:
+  claude-data-dev:

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,8 @@ import (
 	"github.com/gwenneg/next-gen-review/backend/internal/events"
 	"github.com/gwenneg/next-gen-review/backend/internal/github"
 	"github.com/gwenneg/next-gen-review/backend/internal/queue"
+	"github.com/gwenneg/next-gen-review/backend/internal/review"
+	"github.com/gwenneg/next-gen-review/backend/internal/store"
 )
 
 type fakeDB struct{ err error }
@@ -65,12 +68,50 @@ func (fakeRepos) PublicRepo(_ context.Context, name string) (string, error) {
 	return strings.ToUpper(name), nil
 }
 
+// fakeReviews knows one queued PR, "PR_1", which has no active review yet, and one active review, 9.
+type fakeReviews struct {
+	created    int
+	activeOnly bool // the last list asked for active reviews only
+}
+
+func (f *fakeReviews) CreateReview(_ context.Context, req review.Request) (review.Review, error) {
+	switch req.PRID {
+	case "PR_1":
+		f.created++
+		return review.Review{ID: 1, PRID: req.PRID, Status: review.StatusQueued}, nil
+	case "PR_active":
+		return review.Review{}, store.ErrActiveReview
+	}
+	return review.Review{}, store.ErrNotInQueue
+}
+func (f *fakeReviews) Reviews(_ context.Context, activeOnly bool) ([]review.Review, error) {
+	f.activeOnly = activeOnly
+	return nil, nil
+}
+func (f *fakeReviews) CancelReview(_ context.Context, id int64) (bool, error) {
+	return id == 9, nil
+}
+
+type fakeBroker struct {
+	wakes     int
+	connected bool
+}
+
+func (f *fakeBroker) Wake() { f.wakes++ }
+func (f *fakeBroker) Next(context.Context, time.Duration) (review.Job, bool, error) {
+	return review.Job{}, false, nil
+}
+func (f *fakeBroker) Progress(context.Context, int64, int) (bool, error) { return false, nil }
+func (f *fakeBroker) Finish(context.Context, int64, review.Outcome)      {}
+func (f *fakeBroker) WorkerConnected() bool                              { return f.connected }
+
 type fakeEvents struct{ ch chan events.Event }
 
 func (f fakeEvents) Subscribe() (<-chan events.Event, func()) { return f.ch, func() {} }
 
 func newDeps() Deps {
-	return Deps{DB: fakeDB{}, Store: &fakeStore{}, Poller: &fakePoller{}, Repos: fakeRepos{}, Events: fakeEvents{make(chan events.Event, 1)}}
+	return Deps{DB: fakeDB{}, Store: &fakeStore{}, Poller: &fakePoller{}, Repos: fakeRepos{}, Events: fakeEvents{make(chan events.Event, 1)},
+		Reviews: &fakeReviews{}, Broker: &fakeBroker{}}
 }
 
 func TestHealth(t *testing.T) {
@@ -147,6 +188,71 @@ func TestWatchedRepos(t *testing.T) {
 				t.Errorf("poller woken %d times, want a wake only when the repos change", poller.wakes)
 			}
 		})
+	}
+}
+
+func TestReviews(t *testing.T) {
+	valid := `{"prId":"PR_1","model":"sonnet","effort":"medium","tokenCap":500000,"context":"focus on retries"}`
+	tests := []struct {
+		name      string
+		path      string
+		body      string
+		crossSite bool
+		status    int
+		created   bool // a review was created
+		woke      bool // the broker was told to look at the reviews again
+	}{
+		{"start", "/api/reviews", valid, false, http.StatusCreated, true, true},
+		{"start with a bad option", "/api/reviews", strings.Replace(valid, "sonnet", "gpt", 1), false, http.StatusBadRequest, false, false},
+		{"start a PR not in the queue", "/api/reviews", strings.Replace(valid, "PR_1", "PR_unknown", 1), false, http.StatusNotFound, false, false},
+		{"start while one is active", "/api/reviews", strings.Replace(valid, "PR_1", "PR_active", 1), false, http.StatusConflict, false, false},
+		{"start from another site (CSRF)", "/api/reviews", valid, true, http.StatusForbidden, false, false},
+		{"cancel", "/api/reviews/9/cancel", "", false, http.StatusNoContent, false, true},
+		{"cancel an inactive review", "/api/reviews/3/cancel", "", false, http.StatusNotFound, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := newDeps()
+			reviews, broker := d.Reviews.(*fakeReviews), d.Broker.(*fakeBroker)
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			req.Host = "127.0.0.1:8080"
+			if tt.crossSite {
+				req.Header.Set("Sec-Fetch-Site", "cross-site")
+				req.Header.Set("Origin", "https://evil.example")
+			}
+			rec := httptest.NewRecorder()
+			New(d).ServeHTTP(rec, req)
+			if rec.Code != tt.status {
+				t.Errorf("status = %d, want %d (body %s)", rec.Code, tt.status, rec.Body.String())
+			}
+			if created, woke := reviews.created > 0, broker.wakes > 0; created != tt.created || woke != tt.woke {
+				t.Errorf("created a review: %v, woke the broker: %v; want %v, %v", created, woke, tt.created, tt.woke)
+			}
+		})
+	}
+}
+
+// The page warns about queued reviews when the worker is missing, and reloads only the active
+// reviews on progress reports.
+func TestListReviews(t *testing.T) {
+	for _, connected := range []bool{true, false} {
+		d := newDeps()
+		d.Broker.(*fakeBroker).connected = connected
+		path := "/api/reviews"
+		if connected {
+			path += "?active=true"
+		}
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = "127.0.0.1:8080"
+		rec := httptest.NewRecorder()
+		New(d).ServeHTTP(rec, req)
+		var body struct{ WorkerConnected bool }
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.WorkerConnected != connected {
+			t.Errorf("body = %s (%v), want workerConnected %v", rec.Body.String(), err, connected)
+		}
+		if got := d.Reviews.(*fakeReviews).activeOnly; got != connected {
+			t.Errorf("GET %s listed active reviews only: %v", path, got)
+		}
 	}
 }
 
