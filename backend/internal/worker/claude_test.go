@@ -133,3 +133,20 @@ func TestEnv(t *testing.T) {
 		}
 	}
 }
+
+// When claude exits without a result, the error ends with the last of what it wrote to stderr.
+func TestRunWithoutResult(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "claude")
+	script := "#!/bin/sh\nhead -c 10000 /dev/zero | tr '\\0' x >&2\necho ' rate limited' >&2\nexit 3\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := Claude{Bin: bin, Env: []string{"PATH=" + os.Getenv("PATH")}, Timeout: 10 * time.Second, ProgressEvery: time.Second}
+	job := review.Job{ID: 1, TokenCap: 1000, Dir: t.TempDir(), Prompt: "review"}
+	got := c.Run(t.Context(), job, func(context.Context, int) (bool, error) { return false, nil })
+	prefix := "claude stopped without a result (exit status 3): "
+	if got.Status != review.StatusFailed || !strings.HasPrefix(got.Error, prefix) || !strings.HasSuffix(got.Error, "x rate limited") ||
+		len(got.Error) > len(prefix)+4096 {
+		t.Errorf("Run() = %s %.80q... (%d bytes), want failed with the end of stderr, at most 4096 bytes of it", got.Status, got.Error, len(got.Error))
+	}
+}

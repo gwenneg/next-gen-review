@@ -19,6 +19,6 @@ logs: ## Follow the logs of all services
 check-claude: ## Make one tiny claude -p call from the worker image, to check the token
 	$(COMPOSE) run --rm --build worker check
 
-test: ## Run the backend tests and build the frontend
+test: ## Run the backend and frontend tests (Docker must be running: the store tests start Postgres)
 	cd backend && go test ./...
-	cd frontend && npm ci --no-fund --no-audit && npm run build && npm run lint
+	cd frontend && npm ci --no-fund --no-audit && npm run build && npm run lint && npm test

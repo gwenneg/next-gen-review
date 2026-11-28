@@ -25,10 +25,13 @@ type fakeDB struct{ err error }
 
 func (f fakeDB) Ping(context.Context) error { return f.err }
 
-type fakeStore struct{ repos []string }
+type fakeStore struct {
+	repos []string
+	err   error // returned by the reads
+}
 
-func (f *fakeStore) Queue(context.Context) ([]github.PullRequest, error) { return nil, nil }
-func (f *fakeStore) WatchedRepos(context.Context) ([]string, error)      { return f.repos, nil }
+func (f *fakeStore) Queue(context.Context) ([]github.PullRequest, error) { return nil, f.err }
+func (f *fakeStore) WatchedRepos(context.Context) ([]string, error)      { return f.repos, f.err }
 func (f *fakeStore) AddWatchedRepo(_ context.Context, name string) error {
 	f.repos = append(f.repos, name)
 	return nil
@@ -70,6 +73,7 @@ func (fakeRepos) PublicRepo(_ context.Context, name string) (string, error) {
 
 // fakeReviews knows one queued PR, "PR_1", which has no active review yet, and one active review, 9.
 type fakeReviews struct {
+	err        error // returned by Reviews
 	created    int
 	activeOnly bool // the last list asked for active reviews only
 }
@@ -81,29 +85,41 @@ func (f *fakeReviews) CreateReview(_ context.Context, req review.Request) (revie
 		return review.Review{ID: 1, PRID: req.PRID, Status: review.StatusQueued}, nil
 	case "PR_active":
 		return review.Review{}, store.ErrActiveReview
+	case "PR_db_down":
+		return review.Review{}, errors.New("conn closed")
 	}
 	return review.Review{}, store.ErrNotInQueue
 }
 func (f *fakeReviews) Reviews(_ context.Context, activeOnly bool) ([]review.Review, error) {
 	f.activeOnly = activeOnly
-	return nil, nil
+	return nil, f.err
 }
 func (f *fakeReviews) CancelReview(_ context.Context, id int64) (bool, error) {
+	if id == 5 {
+		return false, errors.New("conn closed")
+	}
 	return id == 9, nil
 }
 
 type fakeBroker struct {
 	wakes     int
 	connected bool
+	job       bool  // Next returns a job
+	err       error // returned by Next and Progress
+	finishErr error // the outcome isn't stored
+	finished  []review.Outcome
 }
 
 func (f *fakeBroker) Wake() { f.wakes++ }
 func (f *fakeBroker) Next(context.Context, time.Duration) (review.Job, bool, error) {
-	return review.Job{}, false, nil
+	return review.Job{ID: 3}, f.job, f.err
 }
-func (f *fakeBroker) Progress(context.Context, int64, int) (bool, error) { return false, nil }
-func (f *fakeBroker) Finish(context.Context, int64, review.Outcome)      {}
-func (f *fakeBroker) WorkerConnected() bool                              { return f.connected }
+func (f *fakeBroker) Progress(context.Context, int64, int) (bool, error) { return true, f.err }
+func (f *fakeBroker) Finish(_ context.Context, _ int64, o review.Outcome) error {
+	f.finished = append(f.finished, o)
+	return f.finishErr
+}
+func (f *fakeBroker) WorkerConnected() bool { return f.connected }
 
 type fakeEvents struct{ ch chan events.Event }
 
@@ -207,8 +223,12 @@ func TestReviews(t *testing.T) {
 		{"start a PR not in the queue", "/api/reviews", strings.Replace(valid, "PR_1", "PR_unknown", 1), false, http.StatusNotFound, false, false},
 		{"start while one is active", "/api/reviews", strings.Replace(valid, "PR_1", "PR_active", 1), false, http.StatusConflict, false, false},
 		{"start from another site (CSRF)", "/api/reviews", valid, true, http.StatusForbidden, false, false},
+		{"start while the database is down", "/api/reviews", strings.Replace(valid, "PR_1", "PR_db_down", 1), false, http.StatusInternalServerError, false, false},
+		{"start with bad json", "/api/reviews", "{", false, http.StatusBadRequest, false, false},
 		{"cancel", "/api/reviews/9/cancel", "", false, http.StatusNoContent, false, true},
 		{"cancel an inactive review", "/api/reviews/3/cancel", "", false, http.StatusNotFound, false, false},
+		{"cancel a bad id", "/api/reviews/x/cancel", "", false, http.StatusBadRequest, false, false},
+		{"cancel while the database is down", "/api/reviews/5/cancel", "", false, http.StatusInternalServerError, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -253,6 +273,76 @@ func TestListReviews(t *testing.T) {
 		if got := d.Reviews.(*fakeReviews).activeOnly; got != connected {
 			t.Errorf("GET %s listed active reviews only: %v", path, got)
 		}
+	}
+}
+
+// The read-only endpoints the page loads, and their answer while the database is down.
+func TestRead(t *testing.T) {
+	for path, want := range map[string]string{
+		"/api/watched-repos":  `{"repos":["o/existing"]}`,
+		"/api/review-options": `"sonnet"`,
+		"/api/queue":          `"items":`,
+		"/api/reviews":        `"reviews":`,
+	} {
+		for _, err := range []error{nil, errors.New("conn closed")} {
+			d := newDeps()
+			d.Store, d.Reviews = &fakeStore{repos: []string{"o/existing"}, err: err}, &fakeReviews{err: err}
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.Host = "127.0.0.1:8080"
+			rec := httptest.NewRecorder()
+			New(d).ServeHTTP(rec, req)
+			status := http.StatusOK
+			if err != nil && path != "/api/review-options" {
+				status, want = http.StatusInternalServerError, `"error":"could not read`
+			}
+			if rec.Code != status || !strings.Contains(rec.Body.String(), want) {
+				t.Errorf("GET %s with store error %v = %d %s, want %d with %s", path, err, rec.Code, rec.Body.String(), status, want)
+			}
+		}
+	}
+}
+
+// The worker's API refuses bad requests and reports the broker's errors. The JSON of the happy
+// paths is tested with the worker's own client, in package worker.
+func TestInternal(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	tests := []struct {
+		name     string
+		method   string
+		path     string
+		body     string
+		broker   fakeBroker
+		ctx      context.Context
+		status   int
+		finished int // outcomes passed to the broker
+	}{
+		{"no job", http.MethodGet, "/internal/jobs/next", "", fakeBroker{}, nil, http.StatusNoContent, 0},
+		{"next fails", http.MethodGet, "/internal/jobs/next", "", fakeBroker{err: errors.New("db down")}, nil, http.StatusInternalServerError, 0},
+		{"worker left", http.MethodGet, "/internal/jobs/next", "", fakeBroker{err: context.Canceled}, canceled, http.StatusNoContent, 0},
+		{"progress", http.MethodPost, "/internal/jobs/3/progress", `{"tokens":5}`, fakeBroker{}, nil, http.StatusOK, 0},
+		{"progress, bad id", http.MethodPost, "/internal/jobs/x/progress", `{"tokens":5}`, fakeBroker{}, nil, http.StatusBadRequest, 0},
+		{"progress, bad body", http.MethodPost, "/internal/jobs/3/progress", `5`, fakeBroker{}, nil, http.StatusBadRequest, 0},
+		{"progress fails", http.MethodPost, "/internal/jobs/3/progress", `{"tokens":5}`, fakeBroker{err: errors.New("db down")}, nil, http.StatusInternalServerError, 0},
+		{"finish", http.MethodPost, "/internal/jobs/3/finish", `{"status":"done"}`, fakeBroker{}, nil, http.StatusNoContent, 1},
+		{"finish not stored yet", http.MethodPost, "/internal/jobs/3/finish", `{"status":"done"}`, fakeBroker{finishErr: errors.New("db down")}, nil, http.StatusServiceUnavailable, 1},
+		{"finish, bad id", http.MethodPost, "/internal/jobs/x/finish", `{"status":"done"}`, fakeBroker{}, nil, http.StatusBadRequest, 0},
+		{"finish, bad body", http.MethodPost, "/internal/jobs/3/finish", `done`, fakeBroker{}, nil, http.StatusBadRequest, 0},
+		{"finish, too large", http.MethodPost, "/internal/jobs/3/finish", `{"result":"` + strings.Repeat("a", 4<<20) + `"}`, fakeBroker{}, nil, http.StatusBadRequest, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := tt.broker
+			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			if tt.ctx != nil {
+				req = req.WithContext(tt.ctx)
+			}
+			rec := httptest.NewRecorder()
+			NewInternal(&b).ServeHTTP(rec, req)
+			if rec.Code != tt.status || len(b.finished) != tt.finished {
+				t.Errorf("status = %d (body %s), outcomes passed on: %d; want %d, %d", rec.Code, rec.Body.String(), len(b.finished), tt.status, tt.finished)
+			}
+		})
 	}
 }
 

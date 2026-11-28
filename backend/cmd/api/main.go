@@ -71,6 +71,9 @@ func run() error {
 		return err
 	}
 	broker := review.NewBroker(st, gh, checkouts)
+	if err := broker.Adopt(ctx); err != nil {
+		return err
+	}
 	if err := broker.RemoveCheckouts(); err != nil {
 		return err
 	}

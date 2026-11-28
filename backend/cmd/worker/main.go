@@ -38,15 +38,24 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	api := worker.NewAPI(base)
 	claude := worker.Claude{Bin: "claude", Env: worker.Env(), Timeout: 30 * time.Minute, ProgressEvery: 2 * time.Second}
 	slog.Info("worker started")
+	serve(ctx, worker.NewAPI(base), claude.Run, os.Getenv("CLAUDE_CODE_OAUTH_TOKEN") != "")
+	slog.Info("worker stopped")
+}
+
+// retryDelay is how long the worker waits after a failed call to the api.
+var retryDelay = 5 * time.Second
+
+// serve runs the api's jobs one at a time, until ctx is done. Without a token, each job fails
+// with a message that says how to set one.
+func serve(ctx context.Context, api *worker.API, run func(context.Context, review.Job, worker.Report) review.Outcome, token bool) {
 	for ctx.Err() == nil {
 		job, ok, err := api.Next(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
 				slog.Warn("get the next job", "error", err)
-				sleep(ctx, 5*time.Second)
+				sleep(ctx, retryDelay)
 			}
 			continue
 		}
@@ -55,20 +64,35 @@ func main() {
 		}
 		slog.Info("review started", "review", job.ID, "model", job.Model, "effort", job.Effort)
 		outcome := review.Outcome{Status: review.StatusFailed, Error: noToken}
-		if os.Getenv("CLAUDE_CODE_OAUTH_TOKEN") != "" {
-			outcome = claude.Run(ctx, job, func(ctx context.Context, tokens int) (bool, error) {
+		if token {
+			outcome = run(ctx, job, func(ctx context.Context, tokens int) (bool, error) {
 				return api.Progress(ctx, job.ID, tokens)
 			})
 		}
 		slog.Info("review finished", "review", job.ID, "status", outcome.Status, "tokens", outcome.Tokens)
-		// The review's own context may be canceled: report with a fresh one.
-		finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		if err := api.Finish(finishCtx, job.ID, outcome); err != nil {
-			slog.Warn("report the review's end", "review", job.ID, "error", err)
-		}
-		cancel()
+		finish(ctx, api, job.ID, outcome)
 	}
-	slog.Info("worker stopped")
+}
+
+// finish reports the outcome, again every retryDelay until the api stored it: the api may be
+// restarting, or its database down. It gives up when the api refuses the request, and after one
+// try when the worker is stopping. Each try has its own context: the review's may be canceled.
+func finish(ctx context.Context, api *worker.API, id int64, o review.Outcome) {
+	for {
+		finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		err := api.Finish(finishCtx, id, o)
+		cancel()
+		if err == nil {
+			return
+		}
+		var refused *worker.StatusError
+		if errors.As(err, &refused) && refused.Code < 500 || ctx.Err() != nil {
+			slog.Error("report the review's end: giving up", "review", id, "error", err)
+			return
+		}
+		slog.Warn("report the review's end: retrying", "review", id, "error", err)
+		sleep(ctx, retryDelay)
+	}
 }
 
 func sleep(ctx context.Context, d time.Duration) {

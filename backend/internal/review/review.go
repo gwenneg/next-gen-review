@@ -2,6 +2,7 @@
 package review
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -19,6 +20,9 @@ const (
 	StatusCanceled  = "canceled"
 	StatusCapped    = "capped" // stopped at the token cap
 )
+
+// ErrNotActive means the review already ended, so its outcome can't be stored.
+var ErrNotActive = errors.New("the review is not active")
 
 // Events sent to the page.
 const (

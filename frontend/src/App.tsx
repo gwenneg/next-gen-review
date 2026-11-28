@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   getQueue,
   getReviewOptions,
@@ -53,15 +53,29 @@ export default function App() {
 
   const [reviews, setReviews] = useState<ReviewsResponse>({ reviews: [], workerConnected: true })
   const [reviewOptions, setReviewOptions] = useState<ReviewOptions>()
+  const [optionsError, setOptionsError] = useState<string>()
+  const optionsLoaded = useRef(false)
+  // Until they load, the options are asked for again on each connection and each reviews load,
+  // so a failure doesn't leave the page without Review buttons.
+  const loadReviewOptions = useCallback(() => {
+    getReviewOptions()
+      .then((o) => {
+        optionsLoaded.current = true
+        setReviewOptions(o)
+        setOptionsError(undefined)
+      })
+      .catch((e) => setOptionsError(e.message))
+  }, [])
   const [reviewsError, setReviewsError] = useState<string>()
   const loadReviews = useCallback(() => {
     getReviews()
       .then((r) => {
         setReviews(r)
         setReviewsError(undefined)
+        if (!optionsLoaded.current) loadReviewOptions()
       })
       .catch((e) => setReviewsError(e.message))
-  }, [])
+  }, [loadReviewOptions])
   // On a progress report, reload only the active reviews: the finished ones have long results.
   const loadActiveReviews = useCallback(() => {
     getReviews(true)
@@ -71,15 +85,6 @@ export default function App() {
           workerConnected: active.workerConnected,
           reviews: prev.reviews.map((r) => byId.get(r.id) ?? r),
         }))
-        setReviewsError(undefined)
-      })
-      .catch((e) => setReviewsError(e.message))
-  }, [])
-  // Called on every (re)connection, so a failure at page load is retried once the api is back.
-  const loadReviewOptions = useCallback(() => {
-    getReviewOptions()
-      .then((o) => {
-        setReviewOptions(o)
         setReviewsError(undefined)
       })
       .catch((e) => setReviewsError(e.message))
@@ -117,10 +122,12 @@ export default function App() {
   }, [load])
 
   const health = useHealth()
+  const [connections, setConnections] = useState(0)
   const live = useLiveUpdates((type) => {
+    if (type === 'connected' || type === 'resync') setConnections((c) => c + 1)
     // resync: the api's database listener reconnected, so events may have been missed.
     if (type === 'connected' || type === 'queue.changed' || type === 'resync') load()
-    if (type === 'connected' || type === 'resync') loadReviewOptions()
+    if ((type === 'connected' || type === 'resync') && !optionsLoaded.current) loadReviewOptions()
     if (type === 'connected' || type === 'review.changed' || type === 'resync') loadReviews()
     if (type === 'review.progress') loadActiveReviews()
   })
@@ -136,6 +143,7 @@ export default function App() {
       </header>
       <main>
         {reviewsError && <p className="error">Could not load the reviews: {reviewsError}</p>}
+        {optionsError && <p className="error">Could not load the review options: {optionsError}</p>}
         <Queue
           queue={queue}
           reviewOptions={reviewOptions}
@@ -145,7 +153,7 @@ export default function App() {
           refreshing={refreshing}
           onRefresh={refresh}
         />
-        <WatchedRepos />
+        <WatchedRepos reload={connections} />
       </main>
     </>
   )

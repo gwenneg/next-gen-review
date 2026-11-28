@@ -1,27 +1,40 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { addWatchedRepo, getWatchedRepos, removeWatchedRepo } from './api'
 
-// Lists the watched repos, with a form to add one and a button to remove each.
-export function WatchedRepos() {
+// Lists the watched repos, with a form to add one and a button to remove each. It loads them each
+// time reload changes, from 1: the page passes the number of live-update connections, and loads
+// everything on each, so a list that failed to load while the api was down comes back with it.
+export function WatchedRepos({ reload }: { reload: number }) {
   const [repos, setRepos] = useState<string[]>([])
   const [input, setInput] = useState('')
-  const [error, setError] = useState<string>()
+  const [loadError, setLoadError] = useState<string>()
+  const [actionError, setActionError] = useState<string>()
   const [busy, setBusy] = useState(false)
+  // Only the latest load's answer is used: an older one may predate an add or remove.
+  const latest = useRef(0)
 
-  const load = () =>
-    getWatchedRepos()
-      .then(setRepos)
-      .catch((e) => setError(e.message))
+  const load = () => {
+    const n = ++latest.current
+    return getWatchedRepos()
+      .then((r) => {
+        if (n !== latest.current) return
+        setRepos(r)
+        setLoadError(undefined)
+      })
+      .catch((e) => {
+        if (n === latest.current) setLoadError(e.message)
+      })
+  }
   useEffect(() => {
-    load()
-  }, [])
+    if (reload > 0) load()
+  }, [reload])
 
   const run = (action: Promise<unknown>) => {
     setBusy(true)
-    setError(undefined)
+    setActionError(undefined)
     return action
       .then(load)
-      .catch((e) => setError(e.message))
+      .catch((e) => setActionError(e.message))
       .finally(() => setBusy(false))
   }
 
@@ -50,7 +63,8 @@ export function WatchedRepos() {
           Add
         </button>
       </form>
-      {error && <p className="error">{error}</p>}
+      {loadError && <p className="error">Could not load the watched repos: {loadError}</p>}
+      {actionError && <p className="error">{actionError}</p>}
     </section>
   )
 }

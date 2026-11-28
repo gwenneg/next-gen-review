@@ -22,6 +22,14 @@ func NewAPI(base string) *API {
 	return &API{Base: base, HTTP: &http.Client{Timeout: 60 * time.Second}}
 }
 
+// StatusError is an answer from the api other than a success.
+type StatusError struct {
+	Method, Path, Status string
+	Code                 int
+}
+
+func (e *StatusError) Error() string { return fmt.Sprintf("%s %s: %s", e.Method, e.Path, e.Status) }
+
 func (a *API) call(ctx context.Context, method, path string, in, out any) (int, error) {
 	var body bytes.Buffer
 	if in != nil {
@@ -39,7 +47,7 @@ func (a *API) call(ctx context.Context, method, path string, in, out any) (int, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return resp.StatusCode, fmt.Errorf("%s %s: %s", method, path, resp.Status)
+		return resp.StatusCode, &StatusError{Method: method, Path: path, Status: resp.Status, Code: resp.StatusCode}
 	}
 	if out != nil && resp.StatusCode != http.StatusNoContent {
 		return resp.StatusCode, json.NewDecoder(resp.Body).Decode(out)
@@ -63,7 +71,7 @@ func (a *API) Progress(ctx context.Context, id int64, tokens int) (bool, error) 
 	return out.Stop, err
 }
 
-// Finish reports how the job ended.
+// Finish reports how the job ended. An error means the api didn't store it.
 func (a *API) Finish(ctx context.Context, id int64, o review.Outcome) error {
 	_, err := a.call(ctx, http.MethodPost, fmt.Sprintf("/internal/jobs/%d/finish", id), o, nil)
 	return err
