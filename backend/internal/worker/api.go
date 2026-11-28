@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/gwenneg/next-gen-review/backend/internal/review"
@@ -26,9 +27,15 @@ func NewAPI(base string) *API {
 type StatusError struct {
 	Method, Path, Status string
 	Code                 int
+	Message              string // the api's error message, if any
 }
 
-func (e *StatusError) Error() string { return fmt.Sprintf("%s %s: %s", e.Method, e.Path, e.Status) }
+func (e *StatusError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("%s %s: %s: %s", e.Method, e.Path, e.Status, e.Message)
+	}
+	return fmt.Sprintf("%s %s: %s", e.Method, e.Path, e.Status)
+}
 
 func (a *API) call(ctx context.Context, method, path string, in, out any) (int, error) {
 	var body bytes.Buffer
@@ -47,7 +54,14 @@ func (a *API) call(ctx context.Context, method, path string, in, out any) (int, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return resp.StatusCode, &StatusError{Method: method, Path: path, Status: resp.Status, Code: resp.StatusCode}
+		e := &StatusError{Method: method, Path: path, Status: resp.Status, Code: resp.StatusCode}
+		var body struct {
+			Error string `json:"error"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&body) == nil {
+			e.Message = body.Error
+		}
+		return resp.StatusCode, e
 	}
 	if out != nil && resp.StatusCode != http.StatusNoContent {
 		return resp.StatusCode, json.NewDecoder(resp.Body).Decode(out)
@@ -74,5 +88,29 @@ func (a *API) Progress(ctx context.Context, id int64, tokens int) (bool, error) 
 // Finish reports how the job ended. An error means the api didn't store it.
 func (a *API) Finish(ctx context.Context, id int64, o review.Outcome) error {
 	_, err := a.call(ctx, http.MethodPost, fmt.Sprintf("/internal/jobs/%d/finish", id), o, nil)
+	return err
+}
+
+// Session returns an ended review's claude session, without downloading its code.
+func (a *API) Session(ctx context.Context, id int64) (review.Resume, error) {
+	var r review.Resume
+	_, err := a.call(ctx, http.MethodGet, fmt.Sprintf("/internal/reviews/%d/session", id), nil, &r)
+	return r, err
+}
+
+// Continue asks the api to download an ended review's code again, and returns its claude session.
+// The download can outlast the client's timeout, so it only has ctx's.
+func (a *API) Continue(ctx context.Context, id int64) (review.Resume, error) {
+	var r review.Resume
+	slow := &API{Base: a.Base, HTTP: &http.Client{}}
+	_, err := slow.call(ctx, http.MethodPost, fmt.Sprintf("/internal/reviews/%d/continue", id), nil, &r)
+	return r, err
+}
+
+// RemoveCheckout asks the api to delete the review's checkout, once the continued session closed.
+// download is Resume.Download: the api keeps a newer download.
+func (a *API) RemoveCheckout(ctx context.Context, id int64, download string) error {
+	path := fmt.Sprintf("/internal/reviews/%d/checkout?download=%s", id, url.QueryEscape(download))
+	_, err := a.call(ctx, http.MethodDelete, path, nil, nil)
 	return err
 }

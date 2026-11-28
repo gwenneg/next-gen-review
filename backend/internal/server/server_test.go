@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -120,6 +121,22 @@ func (f *fakeBroker) Finish(_ context.Context, _ int64, o review.Outcome) error 
 	return f.finishErr
 }
 func (f *fakeBroker) WorkerConnected() bool { return f.connected }
+func (f *fakeBroker) Session(_ context.Context, id int64) (review.Resume, error) {
+	return review.Resume{SessionID: "s"}, continueErr(id)
+}
+func (f *fakeBroker) PrepareContinue(_ context.Context, id int64) (review.Resume, error) {
+	return review.Resume{SessionID: "s"}, continueErr(id)
+}
+func (f *fakeBroker) RemoveCheckout(_ context.Context, id int64, _ string) error {
+	return continueErr(id)
+}
+
+// continueErr is the broker's answer about review id: 4 ended, 5 is running, 6 doesn't exist,
+// GitHub fails for 7, 8 is being downloaded for another continue, and the database is down for 9.
+func continueErr(id int64) error {
+	return map[int64]error{5: review.ErrActive, 6: review.ErrUnknownReview, 7: fmt.Errorf("%w: HTTP 502", review.ErrDownload),
+		8: review.ErrDownloading, 9: errors.New("conn closed")}[id]
+}
 
 type fakeEvents struct{ ch chan events.Event }
 
@@ -328,6 +345,19 @@ func TestInternal(t *testing.T) {
 		{"finish not stored yet", http.MethodPost, "/internal/jobs/3/finish", `{"status":"done"}`, fakeBroker{finishErr: errors.New("db down")}, nil, http.StatusServiceUnavailable, 1},
 		{"finish, bad id", http.MethodPost, "/internal/jobs/x/finish", `{"status":"done"}`, fakeBroker{}, nil, http.StatusBadRequest, 0},
 		{"finish, bad body", http.MethodPost, "/internal/jobs/3/finish", `done`, fakeBroker{}, nil, http.StatusBadRequest, 0},
+		{"continue", http.MethodPost, "/internal/reviews/4/continue", "", fakeBroker{}, nil, http.StatusOK, 0},
+		{"continue a running review", http.MethodPost, "/internal/reviews/5/continue", "", fakeBroker{}, nil, http.StatusConflict, 0},
+		{"continue an unknown review", http.MethodPost, "/internal/reviews/6/continue", "", fakeBroker{}, nil, http.StatusNotFound, 0},
+		{"continue while GitHub fails", http.MethodPost, "/internal/reviews/7/continue", "", fakeBroker{}, nil, http.StatusBadGateway, 0},
+		{"continue during another one's download", http.MethodPost, "/internal/reviews/8/continue", "", fakeBroker{}, nil, http.StatusConflict, 0},
+		{"continue while the database is down", http.MethodPost, "/internal/reviews/9/continue", "", fakeBroker{}, nil, http.StatusInternalServerError, 0},
+		{"session", http.MethodGet, "/internal/reviews/4/session", "", fakeBroker{}, nil, http.StatusOK, 0},
+		{"session of a running review", http.MethodGet, "/internal/reviews/5/session", "", fakeBroker{}, nil, http.StatusConflict, 0},
+		{"delete the checkout while the database is down", http.MethodDelete, "/internal/reviews/9/checkout", "", fakeBroker{}, nil, http.StatusInternalServerError, 0},
+		{"continue, bad id", http.MethodPost, "/internal/reviews/x/continue", "", fakeBroker{}, nil, http.StatusBadRequest, 0},
+		{"delete the checkout", http.MethodDelete, "/internal/reviews/4/checkout", "", fakeBroker{}, nil, http.StatusNoContent, 0},
+		{"delete a running review's checkout", http.MethodDelete, "/internal/reviews/5/checkout", "", fakeBroker{}, nil, http.StatusConflict, 0},
+		{"delete the checkout, bad id", http.MethodDelete, "/internal/reviews/x/checkout", "", fakeBroker{}, nil, http.StatusBadRequest, 0},
 		{"finish, too large", http.MethodPost, "/internal/jobs/3/finish", `{"result":"` + strings.Repeat("a", 4<<20) + `"}`, fakeBroker{}, nil, http.StatusBadRequest, 0},
 	}
 	for _, tt := range tests {

@@ -65,6 +65,19 @@ func (s *Store) Reviews(ctx context.Context, activeOnly bool) ([]review.Review, 
 	return pgx.CollectRows(rows, scanReview)
 }
 
+// Review returns one review, or false if no review has this id.
+func (s *Store) Review(ctx context.Context, id int64) (review.Review, bool, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+reviewColumns+` FROM reviews WHERE id = $1`, id)
+	if err != nil {
+		return review.Review{}, false, err
+	}
+	r, err := pgx.CollectExactlyOneRow(rows, scanReview)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return r, false, nil
+	}
+	return r, err == nil, err
+}
+
 // ClaimReview moves the oldest queued review to preparing and returns it, or returns false. The
 // event is in the same transaction, so a failure can't leave a claimed review nobody prepares.
 func (s *Store) ClaimReview(ctx context.Context) (review.Review, bool, error) {

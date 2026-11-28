@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { ReviewPanel } from './ReviewPanel'
 import { fakeFetch } from './test/fakes'
 import { options, pr, review } from './test/data'
@@ -71,5 +71,23 @@ describe('ReviewPanel', () => {
     expect(screen.getByText(/Stopped at the token cap/)).toBeTruthy()
     expect(screen.getByText(/on an older commit/)).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Review again' })).toBeTruthy()
+  })
+
+  it('shows how to continue an ended review in a terminal, and copies it', async () => {
+    const writeText = vi.fn(async () => {})
+    vi.stubGlobal('navigator', { clipboard: { writeText } })
+    render(<ReviewPanel pr={pr} options={options} latest={review({ id: 12, status: 'done' })} workerConnected />)
+    expect(screen.getByText('make continue REVIEW=12')).toBeTruthy()
+    await userEvent.click(screen.getByRole('button', { name: 'Copy' }))
+    expect(writeText).toHaveBeenCalledWith('make continue REVIEW=12')
+    expect(screen.getByRole('button', { name: 'Copied' })).toBeTruthy()
+  })
+
+  it.each([
+    ['running', 1234], // its run still holds the session
+    ['failed', 0], // claude never ran: there's no session
+  ] as const)('offers no continue for a review %s with %s tokens', (status, tokensUsed) => {
+    render(<ReviewPanel pr={pr} options={options} latest={review({ status, tokensUsed })} workerConnected />)
+    expect(screen.queryByText(/make continue/)).toBeNull()
   })
 })

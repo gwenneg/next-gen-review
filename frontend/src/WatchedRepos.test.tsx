@@ -54,7 +54,7 @@ describe('WatchedRepos', () => {
 
   // A reload sent before a remove answers after the remove's own reload: its old list is ignored.
   it('ignores a load that answers after a newer one', async () => {
-    let release = (_: unknown) => {}
+    let release = () => {}
     let first = true
     let repos = ['o/a']
     fakeFetch({
@@ -74,7 +74,7 @@ describe('WatchedRepos', () => {
     await act(async () => rerender(<WatchedRepos reload={2} />))
     await userEvent.click(await screen.findByRole('button', { name: 'Remove o/a' }))
     await waitFor(() => expect(screen.queryByText('o/a')).toBeNull())
-    await act(async () => release(undefined))
+    await act(async () => release())
     expect(screen.queryByText('o/a')).toBeNull()
   })
 

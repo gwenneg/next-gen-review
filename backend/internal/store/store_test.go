@@ -135,6 +135,12 @@ func TestReviewLifecycle(t *testing.T) {
 		t.Errorf("a second CreateReview() = %v, want ErrActiveReview", err)
 	}
 
+	if got, ok, err := s.Review(ctx, r.ID); err != nil || !ok || got.ID != r.ID || got.SessionID != r.SessionID {
+		t.Errorf("Review() = %+v, %v, %v; want the review", got, ok, err)
+	}
+	if _, ok, err := s.Review(ctx, 999); ok || err != nil {
+		t.Errorf("Review(unknown) = %v, %v; want false", ok, err)
+	}
 	claimed, ok, err := s.ClaimReview(ctx)
 	if err != nil || !ok || claimed.ID != r.ID || claimed.Status != review.StatusPreparing || claimed.StartedAt == nil {
 		t.Fatalf("ClaimReview() = %+v, %v, %v; want the review, preparing", claimed, ok, err)
